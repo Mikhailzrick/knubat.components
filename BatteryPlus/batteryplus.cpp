@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <csignal>
@@ -35,21 +36,17 @@ static constexpr const char* MAP_FILE = "/userdata/system/battery-voltage.map";
 static constexpr const char* PERCENT_FILE = "/tmp/battery.percent";
 static constexpr const char* HOOK_ROOT = "/etc/batteryplus"; // use {charging.d, discharging.d}
 
+// Timers
 static constexpr int BASE_INTERVAL_S = 60;
 static constexpr int FAST_INTERVAL_S = 10;
+static constexpr int FASTER_INTERVAL_S = 5;
 
 // EMA parameters
 static constexpr int ALPHA_NUM = 2;
 static constexpr int ALPHA_DEN = 10;
 
-// Blending weights
-static constexpr int MAX_CHARGE_VOLT_WEIGHT = 30; // cap voltage influence when charging
-
-// Snap-to-target if the deviation is too large
-static constexpr int SNAP_DELTA = 6;  // percent
-
 // RAW0 arming threshold
-static constexpr int RAW0_ARM_THRESHOLD = 10;
+static constexpr int RAW0_ARM_THRESHOLD = 1;
 
 // Defaults for map if missing
 static constexpr int DEFAULT_V_FULL = 4000;  // mV
@@ -96,6 +93,45 @@ static bool write_atomic(const fs::path& path, const std::string& data, mode_t m
     return ::rename(tmp.c_str(), path.c_str()) == 0;
 }
 
+static inline int parse_leading_bucket(const std::string& fname) {
+    if (fname.empty() || !std::isdigit((unsigned char)fname[0])) return -1;
+    int i = 0, v = 0;
+    while (i < (int)fname.size() && std::isdigit((unsigned char)fname[i]) && i < 3) {
+        v = v * 10 + (fname[i] - '0');
+        ++i;
+    }
+    return (v >= 0 && v <= 100) ? v : -1;
+}
+
+static inline int clampi(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static int median3(int a, int b, int c) {
+    if (a > b) std::swap(a, b);
+    if (b > c) std::swap(b, c);
+    if (a > b) std::swap(a, b);
+    return b;
+}
+
+static inline bool is_charging(const fs::path& status_path) {
+    int fd = ::open(status_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char buf[8];
+    ssize_t n = ::read(fd, buf, sizeof(buf));
+    ::close(fd);
+    if (n <= 0) return false;
+
+    // Check if status starts with "C"(Charging) or "F"(Full)
+    char c = buf[0];
+    return (c == 'C' || c == 'F');
+}
+
+// ========================= Hook System =========================
+// Execute all executables in {charging|discharging}.d whose filename starts with the battery% number.
+// Supports plain and zero-padded, e.g., "50", "050", "50-".
+// Wildcards: filenames that do NOT start with a digit run on every bucket change.
+
 static bool is_executable(const fs::directory_entry& de) {
     if (!de.is_regular_file()) return false;
     return ::access(de.path().c_str(), X_OK) == 0;
@@ -121,65 +157,75 @@ static int run_hook_file(const fs::path& file) {
     return status;
 }
 
-// Execute all executables in {charging|discharging}.d whose filename starts with the battery% number.
-// Supports plain and zero-padded, e.g., "50", "050", "50-".
-// Wildcards: filenames that do NOT start with a digit run on every bucket change.
-static void run_bucket_hooks(const std::string& phase, int bucket) {
-    fs::path dir = fs::path(HOOK_ROOT) / (phase + ".d");
-    if (!fs::exists(dir) || !fs::is_directory(dir)) return;
+static constexpr int NUM_BUCKETS = 21; // 0 -> 100 in 5% increments
 
-    std::vector<fs::directory_entry> bucket_entries;
-    std::vector<fs::directory_entry> wildcard_entries;
+struct HookCache {
+    std::array<std::vector<fs::path>, NUM_BUCKETS> charging;
+    std::vector<fs::path> charging_any;
+    std::array<std::vector<fs::path>, NUM_BUCKETS> discharging;
+    std::vector<fs::path> discharging_any;
+    bool loaded = false;
+};
+
+static inline int bucket5(int percent) {
+    percent = clampi(percent, 0, 100);
+    return (percent / 5) * 5;
+}
+
+static inline int bucket_index(int percent) {
+    return bucket5(percent) / 5;
+}
+
+static void scan_hook_dir(const fs::path& dir,
+                       std::array<std::vector<fs::path>, NUM_BUCKETS>& buckets,
+                       std::vector<fs::path>& wildcards)
+{
+    if (!fs::exists(dir) || !fs::is_directory(dir)) return;
 
     for (auto& de : fs::directory_iterator(dir)) {
         if (!is_executable(de)) continue;
-        std::string fname = de.path().filename().string();
-        if (fname.empty()) continue;
+        const std::string fname = de.path().filename().string();
 
-        // Wildcard: first char is NOT a digit -> always run on bucket change
-        if (!std::isdigit(static_cast<unsigned char>(fname[0]))) {
-            wildcard_entries.push_back(de);
+        int n = parse_leading_bucket(fname); // numeric prefix
+        if (n >= 0 && n <= 100 && n % 5 == 0) {
+            int bi = bucket_index(n);
+            buckets[bi].push_back(de.path());
+        } else if (n < 0) {
+            wildcards.push_back(de.path()); // non-numeric: wildcard
+        } else {
+            // Ignore numbers not multiple of 5%
             continue;
         }
-
-        // Bucket script: parse leading integer prefix (up to 3 digits)
-        int i = 0;
-        while (i < static_cast<int>(fname.size()) && std::isdigit(static_cast<unsigned char>(fname[i])) && i < 3) {
-            ++i;
-        }
-        if (i == 0) continue;
-        int val = 0;
-        try {
-            val = std::stoi(fname.substr(0, i));
-        } catch (...) {
-            continue;
-        }
-        // Only exact buckets in range 0-100 are valid
-        if (val < 0 || val > 100) continue;
-        if (val == bucket) bucket_entries.push_back(de);
-    }
-    std::sort(bucket_entries.begin(), bucket_entries.end(),
-              [](const auto& a, const auto& b){
-                  return a.path().filename().string() < b.path().filename().string();
-              });
-    for (auto& de : bucket_entries) run_hook_file(de.path());
-
-    std::sort(wildcard_entries.begin(), wildcard_entries.end(),
-              [](const auto& a, const auto& b){
-                  return a.path().filename().string() < b.path().filename().string();
-              });
-    for (auto& de : wildcard_entries) run_hook_file(de.path());
     }
 
-static inline int clampi(int v, int lo, int hi) {
-    return v < lo ? lo : (v > hi ? hi : v);
+    auto sorter = [](auto& v){ std::sort(v.begin(), v.end()); };
+    for (auto& v : buckets) sorter(v);
+    sorter(wildcards);
 }
 
-static int median3(int a, int b, int c) {
-    if (a > b) std::swap(a, b);
-    if (b > c) std::swap(b, c);
-    if (a > b) std::swap(a, b);
-    return b;
+static void load_hook_cache(HookCache& hc) {
+    fs::create_directories(fs::path(HOOK_ROOT) / "charging.d");
+    fs::create_directories(fs::path(HOOK_ROOT) / "discharging.d");
+    scan_hook_dir(fs::path(HOOK_ROOT) / "charging.d",    hc.charging,    hc.charging_any);
+    scan_hook_dir(fs::path(HOOK_ROOT) / "discharging.d", hc.discharging, hc.discharging_any);
+    hc.loaded = true;
+}
+
+static inline void run_paths(const std::vector<fs::path>& paths) {
+    for (const auto& p : paths) {
+        if (::access(p.c_str(), X_OK) == 0)
+            run_hook_file(p);
+    }
+}
+
+static void run_bucket_hooks_cached(const HookCache& hc, bool charging, int percent_value) {
+    if (!hc.loaded) return;
+    int bi = bucket_index(percent_value);
+    const auto& buckets = charging ? hc.charging : hc.discharging;
+    const auto& any     = charging ? hc.charging_any : hc.discharging_any;
+
+    run_paths(buckets[bi]); // run all scripts for this 5% bucket
+    run_paths(any);         // wildcard scripts every change
 }
 
 // ========================= Battery discovery =========================
@@ -281,11 +327,7 @@ static int read_voltage_mv(const fs::path& voltage_now) {
     return raw; // mV
 }
 
-static inline bool is_charging(const std::string& st) {
-    return (st == "Charging" || st == "Full");
-}
-
-static int blend_percent(int raw_adj, int voltage_now_mv, const MapVals& m, const std::string& status) {
+static int blend_percent(int raw_adj, int voltage_now_mv, const MapVals& m) {
     raw_adj = clampi(raw_adj, 0, 100);
 
     int voltage_percent = raw_adj; // fallback
@@ -305,18 +347,13 @@ static int blend_percent(int raw_adj, int voltage_now_mv, const MapVals& m, cons
         weight_raw = 100 - weight_volt;
     }
 
-    if (is_charging(status)) {
-        if (weight_volt > MAX_CHARGE_VOLT_WEIGHT) weight_volt = MAX_CHARGE_VOLT_WEIGHT;
-        weight_raw = 100 - weight_volt;
-    }
-
     int blended = (weight_raw * raw_adj + weight_volt * voltage_percent) / 100;
     return clampi(blended, 0, 100);
 }
 
-static int step_limit(int last, int target, const std::string& status) {
+static int step_limit(int last, int target, bool charging) {
     if (last < 0) return target; // first value
-    if (is_charging(status)) {
+    if (charging) {
         if (target <= last) return last;           // never decrease while charging
         if (target <= last + 1) return target;     // rise at most +1
         return last + 1;
@@ -325,11 +362,6 @@ static int step_limit(int last, int target, const std::string& status) {
         if (target >= last - 1) return target;     // drop at most -1
         return last - 1;
     }
-}
-
-static int bucket5(int percent) {
-    percent = clampi(percent, 0, 100);
-    return (percent / 5) * 5;
 }
 
 // ========================= Signal handling =========================
@@ -346,6 +378,9 @@ int main() {
     fs::create_directories(fs::path(HOOK_ROOT));
     fs::create_directories(fs::path(HOOK_ROOT) / "charging.d");
     fs::create_directories(fs::path(HOOK_ROOT) / "discharging.d");
+
+    HookCache hooks;
+    load_hook_cache(hooks);
 
     // Find battery
     auto bp_opt = find_battery();
@@ -374,10 +409,22 @@ int main() {
 
     while (g_running) {
         // Read status, capacity, voltage
-        std::string status = slurp(bp.status).value_or("Unknown");
         int raw_capacity = slurp_int(bp.capacity).value_or(-1);
         raw_capacity = clampi(raw_capacity, 0, 100);
         int voltage_raw_mv = read_voltage_mv(bp.voltage_now);
+        bool charging = is_charging(bp.status);
+
+        bool woke = g_wakeup.exchange(false);
+
+        // Soft reset live smoothing
+        if (woke) {
+        sv.prev1 = sv.prev2 = sv.ema = -1;
+
+            if (voltage_raw_mv > 0) {
+                sv.prev1 = sv.prev2 = voltage_raw_mv;
+                sv.ema   = voltage_raw_mv;
+            }
+        }
 
         // Median-of-3 then EMA for live voltage (for calculations only)
         if (sv.prev1 < 0) sv.prev1 = (voltage_raw_mv > 0 ? voltage_raw_mv : map.V_FULL);
@@ -405,28 +452,32 @@ int main() {
         raw_adj = clampi(raw_adj, 0, 100);
 
         // Blended target
-        int target = blend_percent(raw_adj, voltage_ema_mv, map, status);
+        int target = blend_percent(raw_adj, voltage_ema_mv, map);
 
-        // Adaptive interval + snap
+        // Determine distance from new target
         int gap = (last_percent < 0) ? 0 : std::abs(last_percent - target);
 
-        // Determine percent
-        int percent;
-        // Snap if woken explicitly or gap exceeds threshold
-        if (g_wakeup.exchange(false) || (last_percent >= 0 && gap > SNAP_DELTA)) {
-            percent = target;
-            cur_interval = BASE_INTERVAL_S;
+        // Choose interval
+        if (gap >= 5) {
+            cur_interval = FASTER_INTERVAL_S;
+        } else if (gap >= 2) {
+            cur_interval = FAST_INTERVAL_S;
         } else {
-            if (!is_charging(status) && gap >= 2)
-                cur_interval = FAST_INTERVAL_S;
-            else if (gap <= 1)
-                cur_interval = BASE_INTERVAL_S;
+            cur_interval = BASE_INTERVAL_S;
+        }
 
-            percent = step_limit(last_percent, target, status);
+        // Determine percent and step limit
+        int percent;
+        // If first run or soft reset: snap to target percent and run single fast pass
+        if (last_percent < 0 || woke) {
+            percent = target;
+            cur_interval = FASTER_INTERVAL_S;
+        } else {
+            percent = step_limit(last_percent, target, charging);
         }
 
         // Update V_FULL when charging/full and raw >= 99 using RAW instantaneous voltage
-        if (is_charging(status) && raw_capacity >= 99 && voltage_raw_mv > 0) {
+        if (charging && raw_capacity >= 99 && voltage_raw_mv > 0) {
             if (std::abs(map.V_FULL - voltage_raw_mv) >= 10) {
                 map.V_FULL = voltage_raw_mv;
                 save_map_atomic(MAP_FILE, map);
@@ -434,7 +485,7 @@ int main() {
         }
 
         // Learn V_RAW0 once (armed at raw > 10), when raw hits 0 and not yet written
-        if (raw0_armed && !raw0_written && raw_capacity == 0 && !is_charging(status)) {
+        if (raw0_armed && !raw0_written && raw_capacity == 0 && !charging) {
             int v_raw0 = v_med; // median-of-3 at this tick
             if (v_raw0 > 0) {
                 map.V_RAW0 = v_raw0;
@@ -448,7 +499,7 @@ int main() {
         // set V_RAW0 = V_EMPTY to ensure a sane stretch point on devices that never hit raw0%
         if (raw0_armed
             && !raw0_written
-            && !is_charging(status)
+            && !charging
             && voltage_raw_mv > 0
             && voltage_raw_mv <= map.V_EMPTY) {
             map.V_RAW0 = map.V_EMPTY;
@@ -467,14 +518,13 @@ int main() {
         // Bucket hooks
         int b = bucket5(percent);
         if (b != last_bucket) {
-            if (is_charging(status)) run_bucket_hooks("charging", b);
-            else run_bucket_hooks("discharging", b);
+            run_bucket_hooks_cached(hooks, charging, percent);
             last_bucket = b;
         }
 
         // Sleep
         for (int i = 0; i < cur_interval && g_running; ++i) {
-            if (g_wakeup.exchange(false)) break;
+            if (g_wakeup.load()) break;
             std::this_thread::sleep_for(1s);
         }
     }
