@@ -257,7 +257,7 @@ static void schedule_timer(){
     return;
   }
   if (RT.state == State::IDLE) {
-    int64_t remain = ext_ms - eff_since;
+    int64_t remain = (idle_ms + ext_ms) - eff_since;
     arm_timer_ms(remain > 1 ? remain : 1);
     return;
   }
@@ -294,7 +294,7 @@ static void reevaluate(){
     if (eff_since >= idle_ms) enter(State::IDLE);
   } else if (RT.state == State::IDLE) {
     if (eff_since < idle_ms) enter(State::ACTIVE);
-    else if (eff_since >= ext_ms) enter(State::EXTENDED);
+    else if (eff_since >= (idle_ms + ext_ms)) enter(State::EXTENDED);
   } else {
     if (eff_since < idle_ms) enter(State::ACTIVE);
   }
