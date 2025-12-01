@@ -1,17 +1,72 @@
-// batteryplus.cpp — battery monitor daemon
-// - Finds battery in /sys/class/power_supply
-// - Computes blended % from raw capacity and voltage (with additional smoothing)
-// - Maintains /userdata/system/battery-voltage.map with V_FULL (raw mV at >=99% while charging/full),
-//   V_EMPTY (fixed, target 0%), V_RAW0 (learned once per process when raw hits 0 after arming at raw>10)
-// - Writes /tmp/battery.percent atomically on change
-// - Executes hooks in /etc/batteryplus/{charging.d,discharging.d} on change (5% increments, example: 50testscript executes at 50%)
-// - Build Arm64: aarch64-linux-gnu-g++ -O3 -flto -std=gnu++20 -Wall -Wextra -pedantic batteryplus.cpp -o batteryplus
+// BatteryPlus — Voltage-only battery monitor daemon for handheld Linux systems
+//
+// Copyright (c) 2025 Mikhailzrick
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License version 2
+// as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License v2
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+//
+// Purpose:
+//   BatteryPlus is an alternative battery reporting daemon that relies solely
+//   on voltage measurements to compute battery percentage. It incorporates
+//   median and exponential smoothing, droop compensation, and adaptive
+//   full-voltage calibration to deliver calm, stable, and intuitive percent
+//   behavior suitable for handheld devices.
+//
+// Core behaviors:
+//
+//   • Voltage-based percent only
+//       - Percent derived exclusively from smoothed voltage
+//       - V_EMPTY fixed (target 0%), V_FULL learned automatically
+//       - Gamma curve to visually linearize discharge behavior
+//
+//   • Median-of-3 + EMA smoothing
+//       - Filters jitter from battery load and charger noise
+//
+//   • Droop compensation
+//       - Adaptive and per-device learning over time
+//
+//   • Adaptive V_FULL learning
+//       - Updates V_FULL once using smoothed (EMA) voltage when status == "Full"
+//       - Saves map file atomically
+//
+//   • Calm percent exposure (UI-friendly)
+//       - Internal percent updated every INTERNAL_INTERVAL_S
+//       - Visible percent written only every WRITE_INTERVAL (halved under LOW_PCT_THRESHOLD)
+//       - On large resume jump (>=3%), snap to internal immediately
+//       - On small delta, smoothly catch up
+//
+//   • Hooks system (5% buckets)
+//       - Runs scripts in /etc/batteryplus/{charging.d|discharging.d}/
+//       - Based on visible percent bucket changes
+//
+// Files:
+//   /tmp/battery.percent                 - exported visible % for UI polling
+//   /userdata/system/batteryplus-voltage.map - stores V_FULL, V_EMPTY, and V_DROOP
+//
+// Build:
+//   aarch64-linux-gnu-g++ -O3 -flto -std=gnu++20 -Wall -Wextra -pedantic batteryplus-vol.cpp -o batteryplus-vol
+//
+//
+// Signals:
+//   SIGTERM / SIGINT — stop daemon
+//   SIGUSR1          — wake/reset; triggers snap if delta is large
 
 #include <algorithm>
 #include <atomic>
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -32,33 +87,33 @@ namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 
 // ========================= Config (constants) =========================
-static constexpr const char* MAP_FILE = "/userdata/system/battery-voltage.map";
+static constexpr const char* MAP_FILE = "/userdata/system/batteryplus-voltage.map";
 static constexpr const char* PERCENT_FILE = "/tmp/battery.percent";
-static constexpr const char* HOOK_ROOT = "/etc/batteryplus"; // use {charging.d, discharging.d}
+static constexpr const char* ROOT = "/etc/batteryplus"; // use {charging.d, discharging.d}
 
 // Timers
-static constexpr int BASE_INTERVAL_S = 60;
-static constexpr int FAST_INTERVAL_S = 10;
-static constexpr int FASTER_INTERVAL_S = 5;
+static constexpr int INTERNAL_INTERVAL_S = 10; // how often internal calculations are done in seconds
+static constexpr int CHARGE_FULL_FALLBACK_TICKS = 30 * 60 / INTERNAL_INTERVAL_S; // 30min at 10s intervals
+
+// Percent write parameters
+static constexpr int LOW_PCT_THRESHOLD = 10; // threshold where we update faster (%)
+static constexpr int WRITE_INTERVAL = 60;
 
 // EMA parameters
 static constexpr int ALPHA_NUM = 2;
 static constexpr int ALPHA_DEN = 10;
 
-// RAW0 arming threshold
-static constexpr int RAW0_ARM_THRESHOLD = 1;
-
 // Defaults for map if missing
-static constexpr int DEFAULT_V_FULL = 4000;  // mV
+static constexpr int DEFAULT_V_FULL = 4000; // mV (absolute ceiling, learned per device)
 static constexpr int DEFAULT_V_EMPTY = 3250; // mV (fixed, never learned)
-static constexpr int DEFAULT_V_RAW0 = 3325;  // mV
+static constexpr int DEFAULT_V_DROOP = 50; // mV (offset applied while charging, learned per device)
 
 // ========================= Globals =========================
 static std::atomic<bool> g_running { true };
-static std::atomic<bool> g_wakeup{false};
+static std::atomic<bool> g_reset{false};
 
 // ========================= Utilities =========================
-static void handle_wakeup(int) { g_wakeup = true; }
+static void handle_reset(int) { g_reset = true; }
 
 static std::optional<std::string> slurp(const fs::path& p) {
     std::ifstream f(p);
@@ -114,17 +169,10 @@ static int median3(int a, int b, int c) {
     return b;
 }
 
-static inline bool is_charging(const fs::path& status_path) {
-    int fd = ::open(status_path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return false;
-    char buf[8];
-    ssize_t n = ::read(fd, buf, sizeof(buf));
-    ::close(fd);
-    if (n <= 0) return false;
-
-    // Check if status starts with "C"(Charging) or "F"(Full)
-    char c = buf[0];
-    return (c == 'C' || c == 'F');
+static std::string read_charge_status(const fs::path& status_path) {
+    auto s = slurp(status_path);
+    if (!s) return "Unknown";
+    return *s;
 }
 
 // ========================= Hook System =========================
@@ -140,8 +188,9 @@ static bool is_executable(const fs::directory_entry& de) {
 static int run_hook_file(const fs::path& file) {
     pid_t pid = ::fork();
     if (pid < 0) return -1;
+
     if (pid == 0) {
-        // redirect stdout/stderr to /dev/null
+        // child
         int nullfd = ::open("/dev/null", O_RDWR);
         if (nullfd >= 0) {
             ::dup2(nullfd, STDOUT_FILENO);
@@ -152,9 +201,30 @@ static int run_hook_file(const fs::path& file) {
         ::execv(argv[0], (char* const*)argv);
         _exit(127);
     }
+
+    // parent: wait with timeout
     int status = 0;
+    constexpr int MAX_MS = 2000; // max time to wait for a hook before terminating it
+    constexpr int STEP_MS = 50; // polling interval to check the hook process
+
+    int waited = 0;
+    while (waited < MAX_MS) {
+        pid_t r = ::waitpid(pid, &status, WNOHANG);
+        if (r == pid) {
+            // child finished
+            return status;
+        } else if (r < 0) {
+            // wait error
+            return -1;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(STEP_MS));
+        waited += STEP_MS;
+    }
+
+    // Timeout: kill the hook
+    ::kill(pid, SIGKILL);
     (void)::waitpid(pid, &status, 0);
-    return status;
+    return -1;
 }
 
 static constexpr int NUM_BUCKETS = 21; // 0 -> 100 in 5% increments
@@ -204,10 +274,10 @@ static void scan_hook_dir(const fs::path& dir,
 }
 
 static void load_hook_cache(HookCache& hc) {
-    fs::create_directories(fs::path(HOOK_ROOT) / "charging.d");
-    fs::create_directories(fs::path(HOOK_ROOT) / "discharging.d");
-    scan_hook_dir(fs::path(HOOK_ROOT) / "charging.d",    hc.charging,    hc.charging_any);
-    scan_hook_dir(fs::path(HOOK_ROOT) / "discharging.d", hc.discharging, hc.discharging_any);
+    fs::create_directories(fs::path(ROOT) / "charging.d");
+    fs::create_directories(fs::path(ROOT) / "discharging.d");
+    scan_hook_dir(fs::path(ROOT) / "charging.d",    hc.charging,    hc.charging_any);
+    scan_hook_dir(fs::path(ROOT) / "discharging.d", hc.discharging, hc.discharging_any);
     hc.loaded = true;
 }
 
@@ -230,15 +300,13 @@ static void run_bucket_hooks_cached(const HookCache& hc, bool charging, int perc
 
 // ========================= Battery discovery =========================
 struct BatteryPaths {
-    fs::path root;
-    fs::path capacity;
     fs::path status;
     fs::path voltage_now;
 };
 
 static std::optional<BatteryPaths> find_battery() {
     auto has_required = [](const fs::path& d){
-        return fs::exists(d/"capacity") && fs::exists(d/"status") && fs::exists(d/"voltage_now");
+        return fs::exists(d/"status") && fs::exists(d/"voltage_now");
     };
 
     std::vector<std::string> patterns = {
@@ -257,8 +325,6 @@ static std::optional<BatteryPaths> find_battery() {
         if (!match) continue;
         if (has_required(de.path())) {
             BatteryPaths bp;
-            bp.root = de.path();
-            bp.capacity = de.path()/"capacity";
             bp.status = de.path()/"status";
             bp.voltage_now = de.path()/"voltage_now";
             return bp;
@@ -269,8 +335,6 @@ static std::optional<BatteryPaths> find_battery() {
     for (auto& de : fs::directory_iterator(base)) {
         if (has_required(de.path())) {
             BatteryPaths bp;
-            bp.root = de.path();
-            bp.capacity = de.path()/"capacity";
             bp.status = de.path()/"status";
             bp.voltage_now = de.path()/"voltage_now";
             return bp;
@@ -282,31 +346,113 @@ static std::optional<BatteryPaths> find_battery() {
 
 // ========================= Map file =========================
 struct MapVals {
-    int V_FULL = DEFAULT_V_FULL;  // mV
-    int V_EMPTY = DEFAULT_V_EMPTY; // mV (fixed)
-    int V_RAW0 = DEFAULT_V_RAW0;  // mV
+    int V_FULL = DEFAULT_V_FULL;
+    int V_EMPTY = DEFAULT_V_EMPTY;
+    int V_DROOP = DEFAULT_V_DROOP;
 };
-
-static MapVals load_map(const fs::path& path) {
-    MapVals m;
-    std::ifstream f(path);
-    if (!f) return m;
-    std::string line;
-    while (std::getline(f, line)) {
-        if (line.rfind("V_FULL=", 0) == 0) m.V_FULL = std::atoi(line.c_str()+7);
-        else if (line.rfind("V_EMPTY=", 0) == 0) m.V_EMPTY = std::atoi(line.c_str()+8);
-        else if (line.rfind("V_RAW0=", 0) == 0) m.V_RAW0 = std::atoi(line.c_str()+7);
-    }
-    return m;
-}
 
 static void save_map_atomic(const fs::path& path, const MapVals& m) {
     std::string data;
     data += "V_FULL=" + std::to_string(m.V_FULL) + "\n";
     data += "V_EMPTY=" + std::to_string(m.V_EMPTY) + "\n";
-    data += "V_RAW0=" + std::to_string(m.V_RAW0) + "\n";
+    data += "V_DROOP=" + std::to_string(m.V_DROOP) + "\n";
     fs::create_directories(path.parent_path());
     (void)write_atomic(path, data, 0644);
+}
+
+static MapVals load_map(const fs::path& path) {
+    MapVals m;
+    bool need_save = false;
+    bool found_vfull = false;
+    bool found_vempty = false;
+    bool found_vdroop = false;
+
+    std::ifstream f(path);
+    if (f) {
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.rfind("V_FULL=", 0) == 0) {
+                m.V_FULL = std::atoi(line.c_str() + 7);
+                found_vfull = true;
+            } else if (line.rfind("V_EMPTY=", 0) == 0) {
+                m.V_EMPTY = std::atoi(line.c_str() + 8);
+                found_vempty = true;
+            } else if (line.rfind("V_DROOP=", 0) == 0) {
+                m.V_DROOP = std::atoi(line.c_str() + 8);
+                found_vdroop = true;
+            }
+        }
+    } else {
+        // No file yet
+        return m;
+    }
+
+    // Ensure defaults if missing
+    if (!found_vfull) {
+        m.V_FULL = DEFAULT_V_FULL;
+        need_save = true;
+    }
+    if (!found_vempty) {
+        m.V_EMPTY = DEFAULT_V_EMPTY;
+        need_save = true;
+    }
+    if (!found_vdroop) {
+        m.V_DROOP = DEFAULT_V_DROOP;
+        need_save = true;
+    }
+
+    // Sanity V_EMPTY
+    if (m.V_EMPTY < 3000 || m.V_EMPTY > 3400) {
+        m.V_EMPTY = DEFAULT_V_EMPTY;
+        need_save = true;
+    }
+
+    // Sanity V_FULL
+    if (m.V_FULL < m.V_EMPTY + 300 || m.V_FULL > 4400) {
+        // Values are probably garbage so reset both main voltages
+        m.V_FULL  = DEFAULT_V_FULL;
+        m.V_EMPTY = DEFAULT_V_EMPTY;
+        need_save = true;
+    }
+
+    // Sanity V_DROOP
+    if (m.V_DROOP <= 1 || m.V_DROOP > 300) {
+        m.V_DROOP = DEFAULT_V_DROOP;
+        need_save = true;
+    }
+
+    if (need_save)
+        save_map_atomic(path, m);
+
+    return m;
+}
+
+static void learn_vdroop(int last_charging_ema_mv, int discharge_ema_mv, MapVals& map, const char* map_file_path) {
+    if (last_charging_ema_mv <= 0 || discharge_ema_mv <= 0) return;
+
+    int sample_mv = last_charging_ema_mv - discharge_ema_mv;
+
+    // Only learn from realistic positive droop
+    if (sample_mv <= 1 || sample_mv >= 300) {
+        return;
+    }
+
+    int scaled_sample = sample_mv;
+
+    int old_droop = (map.V_DROOP > 0 ? map.V_DROOP : DEFAULT_V_DROOP);
+
+    // 75% old, 25% new
+    int updated = (3 * old_droop + scaled_sample) / 4;
+    int max_step = 20; // allow at most +20mV per learn
+    if (updated > old_droop + max_step) {
+        updated = old_droop + max_step;
+    }
+    updated = clampi(updated, 1, 300); // final safety check
+
+    if (updated != map.V_DROOP) {
+        map.V_DROOP = updated;
+        save_map_atomic(map_file_path, map);
+    }
 }
 
 // ========================= Percent calc =========================
@@ -327,28 +473,104 @@ static int read_voltage_mv(const fs::path& voltage_now) {
     return raw; // mV
 }
 
-static int blend_percent(int raw_adj, int voltage_now_mv, const MapVals& m) {
-    raw_adj = clampi(raw_adj, 0, 100);
+// Dynamic droop compensation
+static int compute_dynamic_droop_mv(int approx_pct, const MapVals& m)
+{
+    approx_pct = clampi(approx_pct, 0, 100);
 
-    int voltage_percent = raw_adj; // fallback
-    int weight_volt = 50;
-    int weight_raw = 50;
+    int range_mv = m.V_FULL - m.V_EMPTY;
 
-    if (m.V_FULL > m.V_EMPTY && voltage_now_mv > 0) {
-        int range = m.V_FULL - m.V_EMPTY;
-        int pos = voltage_now_mv - m.V_EMPTY;
-        pos = clampi(pos, 0, range);
-        voltage_percent = (pos * 100) / range;
-        voltage_percent = clampi(voltage_percent, 0, 100);
+    // Baseline learned device droop
+    int base = (m.V_DROOP > 0 ? m.V_DROOP : DEFAULT_V_DROOP);
 
-        // near-empty bias: higher voltage weight near empty
-        weight_volt = ((range - pos) * 100) / range; // 0 near full, 100 near empty
-        weight_volt = clampi(weight_volt, 5, 95);
-        weight_raw = 100 - weight_volt;
+    // curb "rapid charging" appearance at low end
+    double factor = 1.0;
+    if (approx_pct <= 60) {
+        // Smooth transition from 2.0 to 1.0
+        double t = approx_pct / 60.0;     // 0 → 1
+        factor = 3.0 - 2.0 * t;
+    } else {
+        factor = 1.0;
     }
 
-    int blended = (weight_raw * raw_adj + weight_volt * voltage_percent) / 100;
-    return clampi(blended, 0, 100);
+    int droop = static_cast<int>(std::lround(base * factor));
+
+    // Clamp just in case
+    int max_global = range_mv / 2; // at most half the voltage window
+    droop = clampi(droop, 10, max_global);
+
+    return droop;
+}
+
+static int stretch_mid_top(int base_pct) {
+    int p = clampi(base_pct, 0, 100);
+
+    // 0–30%: leave it alone
+    if (p <= 30) return p;
+
+    // Remap 30–100%
+    double t = (p - 30) / 70.0;
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+
+    // Smoothstep S-curve in this range
+    double s = t * t * (3.0 - 2.0 * t);
+
+    // Map back to [30,100]
+    double ideal = 30.0 + 70.0 * s;
+
+    constexpr double STRETCH_STRENGTH = 0.7;
+
+    double blended = p + STRETCH_STRENGTH * (ideal - p);
+
+    int result = static_cast<int>(std::lround(blended));
+    return clampi(result, 0, 100);
+}
+
+static int voltage_to_percent(int voltage_now_mv, const MapVals& m) {
+    if (voltage_now_mv <= 0) {
+        // If we somehow get garbage voltage just return 1% so it's intentionally obvious
+        return 1;
+    }
+
+    int v_empty = m.V_EMPTY;
+    int v_full  = m.V_FULL;
+
+    // Apply a dynamic offset so when unplugging charger it's not a steep drop
+    int margin_range = v_full - v_empty;
+    int padding_mv = static_cast<int>(margin_range * 0.01); // % of range
+    int margin_mv = m.V_DROOP > 0 ? m.V_DROOP + padding_mv : DEFAULT_V_DROOP + padding_mv;
+
+    margin_mv = clampi(margin_mv, 20, 200); // safety range
+
+    int vfull_adj = v_full - margin_mv;
+
+    // Guard in case something weird sneaks through.
+    if (vfull_adj <= v_empty) {
+        vfull_adj = v_empty + 50;
+    }
+
+    // Clamp voltage into [V_EMPTY, V_FULL_ADJ].
+    int v_clamped = clampi(voltage_now_mv, v_empty, vfull_adj);
+    int range = vfull_adj - v_empty;
+    double x = 0.0;
+    if (range > 0) {
+        x = static_cast<double>(v_clamped - v_empty) / static_cast<double>(range);
+    }
+    if (x < 0.0) x = 0.0;
+    if (x > 1.0) x = 1.0;
+
+    // Apply gamma curve: compresses midrange and extended the ends
+    constexpr double gamma = 1.20;
+    double shaped = std::pow(x, gamma);
+
+    int base_percent = static_cast<int>(std::lround(shaped * 100.0));
+    base_percent = clampi(base_percent, 0, 100);
+
+    // Stretch mid + top range a bit
+    int target_percent = stretch_mid_top(base_percent);
+
+    return target_percent;
 }
 
 static int step_limit(int last, int target, bool charging) {
@@ -372,12 +594,12 @@ int main() {
     // Signals
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
-    std::signal(SIGUSR1, handle_wakeup);
+    std::signal(SIGUSR1, handle_reset);
 
     // Ensure directories exist
-    fs::create_directories(fs::path(HOOK_ROOT));
-    fs::create_directories(fs::path(HOOK_ROOT) / "charging.d");
-    fs::create_directories(fs::path(HOOK_ROOT) / "discharging.d");
+    fs::create_directories(fs::path(ROOT));
+    fs::create_directories(fs::path(ROOT) / "charging.d");
+    fs::create_directories(fs::path(ROOT) / "discharging.d");
 
     HookCache hooks;
     load_hook_cache(hooks);
@@ -394,137 +616,239 @@ int main() {
     MapVals map = load_map(MAP_FILE);
 
     if (!fs::exists(MAP_FILE)) {
-    fs::create_directories(fs::path(MAP_FILE).parent_path());
-    save_map_atomic(MAP_FILE, map);
+        fs::create_directories(fs::path(MAP_FILE).parent_path());
+        save_map_atomic(MAP_FILE, map);
     }
 
     // State
     SmoothedV sv;
-    int last_percent = -1;
-    int last_bucket = -1;
-    bool raw0_armed = false;
-    bool raw0_written = false; // per process
+    int internal_percent     = -1; // smoothed percent from voltage
+    int visible_percent      = -1; // step-limited percent we expose
+    int last_bucket          = -1;
+    int last_charging_ema_mv = -1;
+    bool vfull_recorded      = false;
 
-    int cur_interval = BASE_INTERVAL_S;
+    // Droop learning: require 3 stable ticks on each side
+    int charging_streak    = 0;
+    int discharging_streak = 0;
+    bool droop_armed       = false;
+
+    auto last_visible_write = std::chrono::steady_clock::now();
 
     while (g_running) {
-        // Read status, capacity, voltage
-        int raw_capacity = slurp_int(bp.capacity).value_or(-1);
-        raw_capacity = clampi(raw_capacity, 0, 100);
+        // Read status and voltage
         int voltage_raw_mv = read_voltage_mv(bp.voltage_now);
-        bool charging = is_charging(bp.status);
+        std::string status_str = read_charge_status(bp.status);
 
-        bool woke = g_wakeup.exchange(false);
+        bool charging = false;
+        bool status_full = false;
+        bool first_visible = (visible_percent < 0);
+        bool reset = g_reset.exchange(false);
+        bool hooks_fired = false;
 
-        // Soft reset live smoothing
-        if (woke) {
-        sv.prev1 = sv.prev2 = sv.ema = -1;
-
-            if (voltage_raw_mv > 0) {
-                sv.prev1 = sv.prev2 = voltage_raw_mv;
-                sv.ema   = voltage_raw_mv;
+        if (!status_str.empty()) {
+            if (status_str.rfind("Charging", 0) == 0) {
+                charging = true;
+            } else if (status_str.rfind("Full", 0) == 0) {
+                charging = true;
+                status_full = true;
             }
+        }
+
+        // Track charging/discharging streaks, and arm droop learning after 3 charging ticks
+        if (charging) {
+            charging_streak++;
+            discharging_streak = 0;
+
+            if (charging_streak >= 3) {
+                droop_armed = true;
+            }
+        } else {
+            discharging_streak++;
+            charging_streak = 0;
         }
 
         // Median-of-3 then EMA for live voltage (for calculations only)
-        if (sv.prev1 < 0) sv.prev1 = (voltage_raw_mv > 0 ? voltage_raw_mv : map.V_FULL);
-        if (sv.prev2 < 0) sv.prev2 = sv.prev1;
-        int v_med = median3(sv.prev2, sv.prev1, voltage_raw_mv > 0 ? voltage_raw_mv : sv.prev1);
+        if (sv.prev1 < 0)
+            sv.prev1 = (voltage_raw_mv > 0 ? voltage_raw_mv : map.V_FULL);
+        if (sv.prev2 < 0)
+            sv.prev2 = sv.prev1;
+
+        int v_med = median3(
+            sv.prev2,
+            sv.prev1,
+            (voltage_raw_mv > 0 ? voltage_raw_mv : sv.prev1)
+        );
+
         sv.prev2 = sv.prev1;
         sv.prev1 = (voltage_raw_mv > 0 ? voltage_raw_mv : sv.prev1);
-        if (sv.ema < 0) sv.ema = v_med;
-        else sv.ema = (ALPHA_NUM * v_med + (ALPHA_DEN - ALPHA_NUM) * sv.ema) / ALPHA_DEN;
+
+        if (sv.ema < 0)
+            sv.ema = v_med;
+        else
+            sv.ema = (ALPHA_NUM * v_med + (ALPHA_DEN - ALPHA_NUM) * sv.ema) / ALPHA_DEN;
+
         int voltage_ema_mv = sv.ema;
 
-        // Arm RAW0 once raw% > 10
-        if (!raw0_written && !raw0_armed && raw_capacity >= RAW0_ARM_THRESHOLD) {
-            raw0_armed = true;
-        }
+        // Voltage droop compensation while charging
+        int voltage_for_percent_mv = voltage_ema_mv;
 
-        // Stretch raw via V_RAW0
-        int scale_mil = 1000;
-        if (map.V_RAW0 > 0 && map.V_FULL > map.V_RAW0) {
-            scale_mil = 1000 * (map.V_FULL - map.V_EMPTY) / (map.V_FULL - map.V_RAW0);
-            if (scale_mil <= 0) scale_mil = 1000;
-        }
-        int raw_adj = raw_capacity;
-        raw_adj = (raw_adj * scale_mil) / 1000;
-        raw_adj = clampi(raw_adj, 0, 100);
+        if (charging) {
+            // Use stable visible percent if available
+            // Otherwise use a draft percent directly from the ema voltage.
+            int approx_pct = (visible_percent >= 0)
+                ? visible_percent
+                : voltage_to_percent(voltage_ema_mv, map);
 
-        // Blended target
-        int target = blend_percent(raw_adj, voltage_ema_mv, map);
+            int droop_mv = compute_dynamic_droop_mv(approx_pct, map);
 
-        // Determine distance from new target
-        int gap = (last_percent < 0) ? 0 : std::abs(last_percent - target);
+            if (droop_mv > 0) {
+                int adjusted = voltage_ema_mv - droop_mv;
 
-        // Choose interval
-        if (gap >= 5) {
-            cur_interval = FASTER_INTERVAL_S;
-        } else if (gap >= 2) {
-            cur_interval = FAST_INTERVAL_S;
-        } else {
-            cur_interval = BASE_INTERVAL_S;
-        }
+                if (adjusted < map.V_EMPTY)
+                    adjusted = map.V_EMPTY;
+                if (adjusted > map.V_FULL)
+                    adjusted = map.V_FULL;
 
-        // Determine percent and step limit
-        int percent;
-        // If first run or soft reset: snap to target percent and run single fast pass
-        if (last_percent < 0 || woke) {
-            percent = target;
-            cur_interval = FASTER_INTERVAL_S;
-        } else {
-            percent = step_limit(last_percent, target, charging);
-        }
-
-        // Update V_FULL when charging/full and raw >= 99 using RAW instantaneous voltage
-        if (charging && raw_capacity >= 99 && voltage_raw_mv > 0) {
-            if (std::abs(map.V_FULL - voltage_raw_mv) >= 10) {
-                map.V_FULL = voltage_raw_mv;
-                save_map_atomic(MAP_FILE, map);
+                voltage_for_percent_mv = adjusted;
             }
         }
 
-        // Learn V_RAW0 once (armed at raw > 10), when raw hits 0 and not yet written
-        if (raw0_armed && !raw0_written && raw_capacity == 0 && !charging) {
-            int v_raw0 = v_med; // median-of-3 at this tick
-            if (v_raw0 > 0) {
-                map.V_RAW0 = v_raw0;
-                save_map_atomic(MAP_FILE, map);
-                raw0_written = true;
-                raw0_armed = false;
+        // Calculate target percent
+        int target = voltage_to_percent(voltage_for_percent_mv, map);
+
+        internal_percent = target;
+
+        bool timeout_full = charging && internal_percent >= 99 && charging_streak >= CHARGE_FULL_FALLBACK_TICKS;
+
+        // Set to 100% once pmic reports
+        if (charging) {
+            if (status_full || timeout_full) {
+                internal_percent = 100;
+            } else if (internal_percent > 99) {
+                internal_percent = 99;
             }
         }
 
-        // Guardrail: if raw0 wasn't learned and we reach/below V_EMPTY while discharging,
-        // set V_RAW0 = V_EMPTY to ensure a sane stretch point on devices that never hit raw0%
-        if (raw0_armed
-            && !raw0_written
-            && !charging
-            && voltage_raw_mv > 0
-            && voltage_raw_mv <= map.V_EMPTY) {
-            map.V_RAW0 = map.V_EMPTY;
-            save_map_atomic(MAP_FILE, map);
-            raw0_written = true;
-            raw0_armed  = false;
+        // Compute delta
+        int delta_pct = 0;
+        if (!first_visible && visible_percent >= 0) {
+            delta_pct = std::abs(internal_percent - visible_percent);
         }
 
-        // Write percent file only on change (atomic)
-        if (percent != last_percent) {
-            fs::create_directories(fs::path(PERCENT_FILE).parent_path());
-            (void)write_atomic(PERCENT_FILE, std::to_string(percent) + "\n", 0644);
-            last_percent = percent;
+        // On reset decide if we should wipe smoothing
+        bool wipe_ema = false;
+        if (reset) {
+            if (first_visible || delta_pct >= 3) {
+                wipe_ema = true;
+            }
         }
 
-        // Bucket hooks
-        int b = bucket5(percent);
-        if (b != last_bucket) {
-            run_bucket_hooks_cached(hooks, charging, percent);
-            last_bucket = b;
+        // If needed reset ema history
+        if (wipe_ema) {
+            if (voltage_raw_mv > 0) {
+                sv.prev1 = sv.prev2 = voltage_raw_mv;
+                sv.ema = voltage_raw_mv;
+            } else {
+                sv.prev1 = sv.prev2 = sv.ema = -1;
+            }
+        }
+
+        // Update V_FULL once when status is "Full"
+        if (!vfull_recorded) {
+            if ((status_full || timeout_full) && voltage_raw_mv > 0) {
+                int diff = voltage_raw_mv - map.V_FULL;
+
+                // Only adjust if difference is meaningful
+                if (std::abs(diff) >= 10) {
+                    map.V_FULL = voltage_ema_mv;
+                    save_map_atomic(MAP_FILE, map);
+                    vfull_recorded = true;
+                }
+            }
+        }
+
+        // Decide if we need to write the file / run hooks
+        bool need_visible_update = false;
+        auto now = std::chrono::steady_clock::now();
+
+        if (first_visible) {
+            // Initial loop
+            need_visible_update = true;
+
+        } else if (internal_percent != visible_percent) {
+            auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - last_visible_write).count();
+
+            // Choose interval based on low or normal range
+            int required_interval = WRITE_INTERVAL;
+            if (internal_percent <= LOW_PCT_THRESHOLD) {
+                required_interval = WRITE_INTERVAL / 2; // lets just halve normal interval
+            }
+
+            if (reset && delta_pct >= 3) {
+                // reset + meaningful change: force write now
+                need_visible_update = true;
+            } else if (elapsed_s >= required_interval) {
+                need_visible_update = true;
+            }
+        }
+
+        if (need_visible_update) {
+            int new_visible = visible_percent;
+
+            if (first_visible) {
+                // Initial loop
+                new_visible = internal_percent;
+            } else if (reset && delta_pct >= 3) {
+                // reset + meaningful change: snap visible to internal
+                new_visible = internal_percent;
+            } else {
+                new_visible = step_limit(visible_percent, internal_percent, charging);
+            }
+
+            if (new_visible != visible_percent) {
+                visible_percent = new_visible;
+                fs::create_directories(fs::path(PERCENT_FILE).parent_path());
+                (void)write_atomic(PERCENT_FILE, std::to_string(visible_percent) + "\n", 0644);
+                last_visible_write = now;
+
+                // fire once and on exact 5% increments
+                if (visible_percent % 5 == 0) {
+                    int b = visible_percent;
+                    if (b != last_bucket) {
+                        run_bucket_hooks_cached(hooks, charging, visible_percent);
+                        last_bucket = b;
+                        hooks_fired = true; // we fired off hooks this loop
+                    }
+                }
+            }
+        }
+
+        // Run wildcard scripts once on reset only if we didn't already
+        if (reset) {
+            if (!hooks_fired) {
+                const auto& any = charging ? hooks.charging_any : hooks.discharging_any;
+                run_paths(any);
+            }
+        }
+
+        // Learn droop once when armed
+        if (droop_armed && !charging && discharging_streak >= 3) {
+            if (last_charging_ema_mv > 0 && v_med > 0) {
+                learn_vdroop(last_charging_ema_mv, v_med,map, MAP_FILE);
+            }
+            // Reset arming
+            droop_armed = false;
+        }
+
+        // Remember last charging voltage for next loop
+        if (charging) {
+            last_charging_ema_mv = voltage_ema_mv;
         }
 
         // Sleep
-        for (int i = 0; i < cur_interval && g_running; ++i) {
-            if (g_wakeup.load()) break;
+        for (int i = 0; i < INTERNAL_INTERVAL_S && g_running; ++i) {
+            if (g_reset.load()) break;
             std::this_thread::sleep_for(1s);
         }
     }
