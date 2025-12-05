@@ -230,8 +230,7 @@ static inline void run_hook_roots(const char* subdir, const char* arg){
 }
 
 // ======== State machine and timers ==========
-static inline int64_t effective_idle_ms() {
-  const int64_t now = now_ms();
+static inline int64_t effective_idle_ms(int64_t now) {
   const int64_t delta = now - RT.last_activity_ms;
   return delta > 0 ? delta : 0;
 }
@@ -243,13 +242,13 @@ static void arm_timer_ms(int64_t ms){
   if(timerfd_settime(RT.tfd,0,&its,nullptr)<0) die("timerfd_settime: %s", strerror(errno));
 }
 
-static void schedule_timer(){
+static void schedule_timer(int64_t now){
   const int64_t idle_ms = (int64_t)RT.idle_s * 1000;
   const int64_t ext_ms  = (int64_t)RT.extended_s * 1000;
 
   if (RT.state == State::EXTENDED) { arm_timer_ms(0); return; }
 
-  const int64_t eff_since = effective_idle_ms();
+  const int64_t eff_since = effective_idle_ms(now);
 
   if (RT.state == State::ACTIVE) {
     int64_t remain = idle_ms - eff_since;
@@ -277,16 +276,16 @@ static void enter(State to){
         run_hook_roots("extended.d", "extended");
 }
 
-static void on_activity(){
-  int64_t now=now_ms();
+static void on_activity(int64_t now){
   if(now-RT.last_pulse_ms<DEBOUNCE_MS) return; // global debounce
-  RT.last_pulse_ms=now; RT.last_activity_ms=now;
+  RT.last_pulse_ms=now;
+  RT.last_activity_ms=now;
   if(RT.state!=State::ACTIVE) enter(State::ACTIVE);
-  schedule_timer();
+  schedule_timer(now);
 }
 
-static void reevaluate(){
-  const int64_t eff_since = effective_idle_ms();
+static void reevaluate(int64_t now){
+  const int64_t eff_since = effective_idle_ms(now);
   const int64_t idle_ms = (int64_t)RT.idle_s * 1000;
   const int64_t ext_ms  = (int64_t)RT.extended_s * 1000;
 
@@ -298,7 +297,7 @@ static void reevaluate(){
   } else {
     if (eff_since < idle_ms) enter(State::ACTIVE);
   }
-  schedule_timer();
+  schedule_timer(now);
 }
 
 // ========== Device discovery and input handling =========
@@ -396,7 +395,7 @@ static void scan_inputs(){
   closedir(d);
 }
 
-static void handle_input(int fd){
+static void handle_input(int fd, int64_t now){
   Dev* dvp = dev_by_fd(fd); if (!dvp) return;
   Dev& dv = *dvp;
   input_event buf[128]; // bigger buffer to drain faster
@@ -410,16 +409,19 @@ static void handle_input(int fd){
     }
     if (n == 0) { del_dev_fd(fd); return; }                // device gone
 
+    if (pulsed) {
+      continue; // just loop back, we only need to drain buffer
+    }
+
     int cnt = n / sizeof(input_event);
     for (int i = 0; i < cnt; ++i) {
       const input_event &e = buf[i];
-      if (pulsed) continue; // we already decided; just draining
       if (e.type == EV_SYN) continue;
 
       switch (e.type) {
         case EV_KEY:
         case EV_REL:
-          on_activity(); pulsed = true; break;
+          on_activity(now); pulsed = true; break;
 
         case EV_ABS: {
           int code = e.code, val = e.value;
@@ -429,16 +431,18 @@ static void handle_input(int fd){
           int delta = std::abs(val - dv.abs_last[code]);
 
           if (is_hat_abs(code)) {
-            if (delta != 0) { dv.abs_last[code] = val; on_activity(); pulsed = true; }
+            if (delta != 0) { dv.abs_last[code] = val; on_activity(now); pulsed = true; }
           } else {
             int dz = dv.abs_dz[code]; // already per-axis
             if (dz <= 0) dz = AXIS_DZ_MIN;
-            if (delta >= dz) { dv.abs_last[code] = val; on_activity(); pulsed = true; }
+            if (delta >= dz) { dv.abs_last[code] = val; on_activity(now); pulsed = true; }
           }
           break;
         }
         default: break;
       }
+
+      if (pulsed) break; // stop parsing this batch
     }
   }
 }
@@ -482,18 +486,22 @@ int main(){
   }
 
   scan_inputs();
-  schedule_timer();
+  int64_t startup_now = now_ms();
+  schedule_timer(startup_now);
 
   std::vector<char> buf(4096);
   std::array<epoll_event,32> events{};
   while (true) {
     int n = epoll_wait(RT.epfd, events.data(), (int)events.size(), -1);
     if (n < 0) { if (errno == EINTR) continue; die("epoll_wait: %s", strerror(errno)); }
+
+    int64_t batch_now = now_ms();
+
     for (int i = 0; i < n; i++) {
       int fd = events[i].data.fd;
       if (fd == RT.tfd) {
         uint64_t exp; (void)read(RT.tfd, &exp, sizeof(exp));
-        reevaluate();
+        reevaluate(batch_now);
       } else if (fd == RT.ifd) {
         ssize_t r;
         while ((r = read(RT.ifd, buf.data(), buf.size())) > 0) {
@@ -508,7 +516,7 @@ int main(){
           }
         }
       } else {
-        handle_input(fd);
+        handle_input(fd, batch_now);
       }
     }
   }
