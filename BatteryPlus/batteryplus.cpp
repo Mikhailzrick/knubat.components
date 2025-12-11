@@ -54,7 +54,7 @@
 //   /userdata/system/batteryplus-voltage.map - stores V_FULL, V_EMPTY, and V_DROOP
 //
 // Build:
-//   aarch64-linux-gnu-g++ -O3 -flto -std=gnu++20 -Wall -Wextra -pedantic batteryplus-vol.cpp -o batteryplus-vol
+//   aarch64-linux-gnu-g++ -O3 -flto -std=gnu++20 -Wall -Wextra -pedantic batteryplus.cpp -o batteryplus
 //
 //
 // Signals:
