@@ -59,7 +59,7 @@
 //
 // Signals:
 //   SIGTERM / SIGINT — stop daemon
-//   SIGUSR1          — wake/reset; triggers snap if delta is large
+//   SIGUSR1          — reset; triggers snap if delta is over threshold (i.e. can be used when resuming from suspend)
 
 #include <algorithm>
 #include <atomic>
@@ -246,9 +246,7 @@ static inline int bucket_index(int percent) {
     return bucket5(percent) / 5;
 }
 
-static void scan_hook_dir(const fs::path& dir,
-                       std::array<std::vector<fs::path>, NUM_BUCKETS>& buckets,
-                       std::vector<fs::path>& wildcards)
+static void scan_hook_dir(const fs::path& dir, std::array<std::vector<fs::path>, NUM_BUCKETS>& buckets, std::vector<fs::path>& wildcards)
 {
     if (!fs::exists(dir) || !fs::is_directory(dir)) return;
 
@@ -295,7 +293,7 @@ static void run_bucket_hooks_cached(const HookCache& hc, bool charging, int perc
     const auto& any     = charging ? hc.charging_any : hc.discharging_any;
 
     run_paths(buckets[bi]); // run all scripts for this 5% bucket
-    run_paths(any);         // wildcard scripts every change
+    run_paths(any); // wildcard scripts every change
 }
 
 // ========================= Battery discovery =========================
@@ -410,7 +408,7 @@ static MapVals load_map(const fs::path& path) {
     // Sanity V_FULL
     if (m.V_FULL < m.V_EMPTY + 300 || m.V_FULL > 4400) {
         // Values are probably garbage so reset both main voltages
-        m.V_FULL  = DEFAULT_V_FULL;
+        m.V_FULL = DEFAULT_V_FULL;
         m.V_EMPTY = DEFAULT_V_EMPTY;
         need_save = true;
     }
@@ -421,8 +419,9 @@ static MapVals load_map(const fs::path& path) {
         need_save = true;
     }
 
-    if (need_save)
+    if (need_save) {
         save_map_atomic(path, m);
+    }
 
     return m;
 }
@@ -437,21 +436,64 @@ static void learn_vdroop(int last_charging_ema_mv, int discharge_ema_mv, MapVals
         return;
     }
 
-    int scaled_sample = sample_mv;
-
     int old_droop = (map.V_DROOP > 0 ? map.V_DROOP : DEFAULT_V_DROOP);
 
-    // 75% old, 25% new
-    int updated = (3 * old_droop + scaled_sample) / 4;
-    int max_step = 20; // allow at most +20mV per learn
-    if (updated > old_droop + max_step) {
-        updated = old_droop + max_step;
-    }
-    updated = clampi(updated, 1, 300); // final safety check
+    // 85% old, 15% new
+    int blended = (17 * old_droop + 3 * sample_mv) / 20;
 
-    if (updated != map.V_DROOP) {
-        map.V_DROOP = updated;
+    int max_step_up = 10;
+    int max_step_down = 5;
+
+    int max_allowed = old_droop + max_step_up;
+    int min_allowed = old_droop - max_step_down;
+
+    if (blended > max_allowed) blended = max_allowed;
+    if (blended < min_allowed) blended = min_allowed;
+
+    blended = clampi(blended, 5, 250);
+
+    int quantized = ((blended + 2) / 5) * 5; // round to nearest 5 mV
+
+    if (std::abs(quantized - map.V_DROOP) < 3) {
+        return;
+    }
+
+    if (quantized != map.V_DROOP) {
+        map.V_DROOP = quantized;
         save_map_atomic(map_file_path, map);
+    }
+}
+
+static void learn_vfull(int voltage_raw_mv, int voltage_ema_mv, MapVals& map) {
+    if (voltage_raw_mv <= 0 || voltage_ema_mv <= 0) {
+        return;
+    }
+
+    int candidate = voltage_ema_mv;
+    int old_vfull = map.V_FULL;
+
+    // Ignore tiny changes
+    int diff = candidate - old_vfull;
+    if (std::abs(diff) < 5) {
+        return;
+    }
+
+    // Don't let a single calibration change it too much
+    constexpr int MAX_SINGLE_STEP = 50; // mv
+    if (diff > MAX_SINGLE_STEP) diff = MAX_SINGLE_STEP;
+    if (diff < -MAX_SINGLE_STEP) diff = -MAX_SINGLE_STEP;
+
+    // 75% old, 25% new
+    int nudged = old_vfull + diff;
+    int blended = (3 * old_vfull + nudged) / 4;
+
+    // Quantize to only keep meaningful changes
+    int quantized = ((blended + 2) / 5) * 5;
+
+    // Only save if meaningfully changed
+    if (std::abs(quantized - old_vfull) >= 5) {
+        map.V_FULL = quantized;
+        save_map_atomic(MAP_FILE, map);
     }
 }
 
@@ -484,13 +526,17 @@ static int compute_dynamic_droop_mv(int approx_pct, const MapVals& m)
     int base = (m.V_DROOP > 0 ? m.V_DROOP : DEFAULT_V_DROOP);
 
     // curb "rapid charging" appearance at low end
+    constexpr double FACTOR_MIN   = 2.0; // droop multiplier at 0%
+    constexpr int    LOW_BAND_MAX = 30; // max % which this stops being applied
+    constexpr double SHAPE_EXP    = 2.0; // >1.0 = more weight near 0%
+
     double factor = 1.0;
-    if (approx_pct <= 60) {
-        // Smooth transition from 2.0 to 1.0
-        double t = approx_pct / 60.0;     // 0 → 1
-        factor = 3.0 - 2.0 * t;
-    } else {
-        factor = 1.0;
+    if (approx_pct < LOW_BAND_MAX) {
+        double t = static_cast<double>(approx_pct) / LOW_BAND_MAX;
+        double w = 1.0 - std::clamp(t, 0.0, 1.0);
+
+        double shaped = std::pow(w, SHAPE_EXP);
+        factor = 1.0 + (FACTOR_MIN - 1.0) * shaped;
     }
 
     int droop = static_cast<int>(std::lround(base * factor));
@@ -502,31 +548,6 @@ static int compute_dynamic_droop_mv(int approx_pct, const MapVals& m)
     return droop;
 }
 
-static int stretch_mid_top(int base_pct) {
-    int p = clampi(base_pct, 0, 100);
-
-    // 0–30%: leave it alone
-    if (p <= 30) return p;
-
-    // Remap 30–100%
-    double t = (p - 30) / 70.0;
-    if (t < 0.0) t = 0.0;
-    if (t > 1.0) t = 1.0;
-
-    // Smoothstep S-curve in this range
-    double s = t * t * (3.0 - 2.0 * t);
-
-    // Map back to [30,100]
-    double ideal = 30.0 + 70.0 * s;
-
-    constexpr double STRETCH_STRENGTH = 0.7;
-
-    double blended = p + STRETCH_STRENGTH * (ideal - p);
-
-    int result = static_cast<int>(std::lround(blended));
-    return clampi(result, 0, 100);
-}
-
 static int voltage_to_percent(int voltage_now_mv, const MapVals& m) {
     if (voltage_now_mv <= 0) {
         // If we somehow get garbage voltage just return 1% so it's intentionally obvious
@@ -536,52 +557,60 @@ static int voltage_to_percent(int voltage_now_mv, const MapVals& m) {
     int v_empty = m.V_EMPTY;
     int v_full  = m.V_FULL;
 
-    // Apply a dynamic offset so when unplugging charger it's not a steep drop
-    int margin_range = v_full - v_empty;
-    int padding_mv = static_cast<int>(margin_range * 0.01); // % of range
-    int margin_mv = m.V_DROOP > 0 ? m.V_DROOP + padding_mv : DEFAULT_V_DROOP + padding_mv;
+    // Apply a dynamic offset from learned v_droop so when unplugging charger it's not a steep drop
+    int droop_mv = (m.V_DROOP > 0 ? m.V_DROOP : DEFAULT_V_DROOP);
+    droop_mv = clampi(droop_mv, 10, 150);
 
-    margin_mv = clampi(margin_mv, 20, 200); // safety range
-
-    int vfull_adj = v_full - margin_mv;
-
-    // Guard in case something weird sneaks through.
-    if (vfull_adj <= v_empty) {
+    int vfull_adj = v_full - droop_mv;
+    if (vfull_adj <= v_empty + 50) {
         vfull_adj = v_empty + 50;
     }
 
-    // Clamp voltage into [V_EMPTY, V_FULL_ADJ].
-    int v_clamped = clampi(voltage_now_mv, v_empty, vfull_adj);
-    int range = vfull_adj - v_empty;
+    int full_range = v_full - v_empty;
+
+    double window_frac = 0.03; // % of total range
+    int window_mv = static_cast<int>(std::lround(full_range * window_frac));
+    window_mv = clampi(window_mv, 10, 30);
+
+    int v_100_start = vfull_adj - window_mv;
+    if (v_100_start < v_empty + 50) {
+        v_100_start = v_empty + 50;
+    }
+
+    // Top 100%
+    if (voltage_now_mv >= v_100_start) {
+        return 100;
+    }
+
+    // 0–99%
+    int v_clamped = clampi(voltage_now_mv, v_empty, v_100_start);
+    int range_adj = v_100_start - v_empty;
     double x = 0.0;
-    if (range > 0) {
-        x = static_cast<double>(v_clamped - v_empty) / static_cast<double>(range);
+    if (range_adj > 0) {
+        x = static_cast<double>(v_clamped - v_empty) / static_cast<double>(range_adj);
     }
     if (x < 0.0) x = 0.0;
     if (x > 1.0) x = 1.0;
 
-    // Apply gamma curve: compresses midrange and extended the ends
     constexpr double gamma = 1.20;
     double shaped = std::pow(x, gamma);
 
     int base_percent = static_cast<int>(std::lround(shaped * 100.0));
-    base_percent = clampi(base_percent, 0, 100);
+    // apply gamma curve to only 0-99% (100% is excluded to keep an accurate top end)
+    base_percent = clampi(base_percent, 0, 99);
 
-    // Stretch mid + top range a bit
-    int target_percent = stretch_mid_top(base_percent);
-
-    return target_percent;
+    return base_percent;
 }
 
 static int step_limit(int last, int target, bool charging) {
     if (last < 0) return target; // first value
     if (charging) {
-        if (target <= last) return last;           // never decrease while charging
-        if (target <= last + 1) return target;     // rise at most +1
+        if (target <= last) return last; // never decrease while charging
+        if (target <= last + 1) return target; // rise at most +1
         return last + 1;
     } else {
-        if (target >= last) return last;           // never increase while discharging/unknown
-        if (target >= last - 1) return target;     // drop at most -1
+        if (target >= last) return last; // never increase while discharging/unknown
+        if (target >= last - 1) return target; // drop at most -1
         return last - 1;
     }
 }
@@ -622,16 +651,16 @@ int main() {
 
     // State
     SmoothedV sv;
-    int internal_percent     = -1; // smoothed percent from voltage
-    int visible_percent      = -1; // step-limited percent we expose
-    int last_bucket          = -1;
+    int internal_percent = -1; // smoothed percent from voltage
+    int visible_percent = -1; // step-limited percent we expose
+    int last_bucket = -1;
     int last_charging_ema_mv = -1;
-    bool vfull_recorded      = false;
+    bool vfull_recorded = false;
 
     // Droop learning: require 3 stable ticks on each side
-    int charging_streak    = 0;
+    int charging_streak = 0;
     int discharging_streak = 0;
-    bool droop_armed       = false;
+    bool droop_armed = false;
 
     auto last_visible_write = std::chrono::steady_clock::now();
 
@@ -757,16 +786,10 @@ int main() {
         // Update V_FULL once when status is "Full"
         if (!vfull_recorded) {
             if ((status_full || timeout_full) && voltage_raw_mv > 0) {
-                int diff = voltage_raw_mv - map.V_FULL;
-
-                // Only adjust if difference is meaningful
-                if (std::abs(diff) >= 10) {
-                    map.V_FULL = voltage_ema_mv;
-                    save_map_atomic(MAP_FILE, map);
-                    vfull_recorded = true;
+                learn_vfull(voltage_raw_mv, voltage_ema_mv, map);
+                vfull_recorded = true;
                 }
             }
-        }
 
         // Decide if we need to write the file / run hooks
         bool need_visible_update = false;
@@ -779,9 +802,9 @@ int main() {
         } else if (internal_percent != visible_percent) {
             auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - last_visible_write).count();
 
-            // Choose interval based on low or normal range
+            // Choose interval based on low or normal range or when charging
             int required_interval = WRITE_INTERVAL;
-            if (internal_percent <= LOW_PCT_THRESHOLD) {
+            if (internal_percent <= LOW_PCT_THRESHOLD || charging) {
                 required_interval = WRITE_INTERVAL / 2; // lets just halve normal interval
             }
 
