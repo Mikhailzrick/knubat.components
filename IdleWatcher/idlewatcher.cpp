@@ -21,9 +21,9 @@
 //   IDLE -> run scripts with arg "idle"
 //   EXTENDED -> run scripts with arg "extended"
 //   ACTIVE -> run scripts with arg "active"
-// Config has hooks_mirror= for secondary/mirrored hook scripts location
+// Config has hooks_dir= for secondary/mirrored hook scripts location
 // Watches /dev/input/event*
-// EV_ABS counts as activity only if delta ≥ AXIS_DZ_PCT
+// EV_ABS counts as activity only if the value delta exceeds a per-axis deadzone.
 // Throttles pulses to reduce excessive work
 // Creates hook directories on startup if missing
 // Build arm: aarch64-linux-gnu-g++ -O3 -flto -std=gnu++20 -Wall -Wextra -pedantic idlewatcher.cpp -o idlewatcher
@@ -159,8 +159,8 @@ static void ensure_default_config(){
         "[Config]\n"
         "idle=%d\n"
         "extended=%d\n"
-        "ABS_Deadzone=%.3f\n"
-        "hooks_mirror=\n",
+        "deadzone=%.3f\n"
+        "hooks_dir=\n",
         DEFAULT_IDLE_S,
         DEFAULT_EXTENDED_S,
         DEFAULT_AXIS_DZ_PCT
@@ -206,9 +206,9 @@ static void read_config_or_defaults(int &idle_s, int &extended_s) {
       } else if (strcmp(key, "extended") == 0) {
         int n = parse_pos_int(val);
         if (n >= 60) extended_s = n;
-      } else if (strcmp(key, "hooks_mirror") == 0) {
+      } else if (strcmp(key, "hooks_dir") == 0) {
         if (*val) HOOKS_MIRROR = val;
-      } else if (strcmp(key, "ABS_Deadzone") == 0) {
+      } else if (strcmp(key, "deadzone") == 0) {
         // Accept either percent like "20" or ratio like "0.2"
         char* end = nullptr;
         double v = strtod(val, &end);

@@ -51,15 +51,18 @@
 //
 // Files:
 //   /tmp/battery.percent                 - exported visible % for UI polling
-//   /userdata/system/batteryplus-voltage.map - stores V_FULL, V_EMPTY, and V_DROOP
+//   <map_dir>/batteryplus-voltage.map    - stores V_FULL, V_EMPTY, and V_DROOP
 //
-// Build:
-//   aarch64-linux-gnu-g++ -O3 -flto -std=gnu++20 -Wall -Wextra -pedantic batteryplus.cpp -o batteryplus
-//
+// Config:
+//   /etc/batteryplus/batteryplus.conf
+//   map_dir is required and should be an absolute path to a persistent directory
 //
 // Signals:
 //   SIGTERM / SIGINT — stop daemon
 //   SIGUSR1          — reset; triggers snap if delta is over threshold (i.e. can be used when resuming from suspend)
+//
+// Build:
+//   aarch64-linux-gnu-g++ -O3 -flto -std=gnu++20 -Wall -Wextra -pedantic batteryplus.cpp -o batteryplus
 
 #include <algorithm>
 #include <atomic>
@@ -71,6 +74,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -78,7 +82,6 @@
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -87,7 +90,8 @@ namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 
 // ========================= Config (constants) =========================
-static constexpr const char* MAP_FILE = "/userdata/system/batteryplus-voltage.map";
+static constexpr const char* MAP_FILENAME = "batteryplus-voltage.map";
+static constexpr const char* CONFIG_FILE = "/etc/batteryplus/batteryplus.conf";
 static constexpr const char* PERCENT_FILE = "/tmp/battery.percent";
 static constexpr const char* ROOT = "/etc/batteryplus"; // use {charging.d, discharging.d}
 
@@ -111,6 +115,7 @@ static constexpr int DEFAULT_V_DROOP = 50; // mV (offset applied while charging,
 // ========================= Globals =========================
 static std::atomic<bool> g_running { true };
 static std::atomic<bool> g_reset{false};
+static fs::path g_map_file;
 
 // ========================= Utilities =========================
 static void handle_reset(int) { g_reset = true; }
@@ -175,6 +180,70 @@ static std::string read_charge_status(const fs::path& status_path) {
     return *s;
 }
 
+// ========================= Config =========================
+static void ensure_config() {
+    struct stat st{};
+    if (::stat(CONFIG_FILE, &st) == 0) return; // already exists
+
+    fs::create_directories(fs::path(ROOT));
+
+    std::FILE* f = std::fopen(CONFIG_FILE, "w");
+    if (!f) return;
+
+    std::fprintf(f,
+        "# map_dir is required and should be an absolute path to a persistent directory\n"
+        "[Config]\n"
+        "map_dir=\n"
+    );
+    std::fclose(f);
+}
+
+static std::string read_config() {
+    std::FILE* f = std::fopen(CONFIG_FILE, "r");
+    if (!f) return {};
+
+    char line[512];
+    std::string out;
+
+    while (std::fgets(line, sizeof(line), f)) {
+        char* p = line;
+
+        // strip leading spaces
+        while (*p == ' ' || *p == '\t') ++p;
+
+        // skip blanks/comments/section headers
+        if (*p == '\0' || *p == '\n' || *p == '#' || *p == '[') continue;
+
+        // key=value
+        char* eq = std::strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char* key = p;
+        char* val = eq + 1;
+
+        // trim trailing key spaces
+        for (char* t = key + std::strlen(key); t > key &&
+             (t[-1] == ' ' || t[-1] == '\t' || t[-1] == '\r' || t[-1] == '\n'); --t)
+            t[-1] = '\0';
+
+        // trim leading val spaces
+        while (*val == ' ' || *val == '\t') ++val;
+
+        // trim trailing val spaces/newlines
+        for (char* t = val + std::strlen(val); t > val &&
+             (t[-1] == ' ' || t[-1] == '\t' || t[-1] == '\r' || t[-1] == '\n'); --t)
+            t[-1] = '\0';
+
+        if (std::strcmp(key, "map_dir") == 0) {
+            out = val; // may be empty; caller decides policy
+            break;
+        }
+    }
+
+    std::fclose(f);
+    return out;
+}
+
 // ========================= Hook System =========================
 // Execute all executables in {charging|discharging}.d whose filename starts with the battery% number.
 // Supports plain and zero-padded, e.g., "50", "050", "50-".
@@ -190,9 +259,10 @@ static int run_hook_file(const fs::path& file) {
     if (pid < 0) return -1;
 
     if (pid == 0) {
-        // child
+        // detach child
         int nullfd = ::open("/dev/null", O_RDWR);
         if (nullfd >= 0) {
+            ::dup2(nullfd, STDIN_FILENO);
             ::dup2(nullfd, STDOUT_FILENO);
             ::dup2(nullfd, STDERR_FILENO);
             ::close(nullfd);
@@ -202,29 +272,8 @@ static int run_hook_file(const fs::path& file) {
         _exit(127);
     }
 
-    // parent: wait with timeout
-    int status = 0;
-    constexpr int MAX_MS = 2000; // max time to wait for a hook before terminating it
-    constexpr int STEP_MS = 50; // polling interval to check the hook process
-
-    int waited = 0;
-    while (waited < MAX_MS) {
-        pid_t r = ::waitpid(pid, &status, WNOHANG);
-        if (r == pid) {
-            // child finished
-            return status;
-        } else if (r < 0) {
-            // wait error
-            return -1;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(STEP_MS));
-        waited += STEP_MS;
-    }
-
-    // Timeout: kill the hook
-    ::kill(pid, SIGKILL);
-    (void)::waitpid(pid, &status, 0);
-    return -1;
+    // fire-and-forget
+    return 0;
 }
 
 static constexpr int NUM_BUCKETS = 21; // 0 -> 100 in 5% increments
@@ -426,7 +475,7 @@ static MapVals load_map(const fs::path& path) {
     return m;
 }
 
-static void learn_vdroop(int last_charging_ema_mv, int discharge_ema_mv, MapVals& map, const char* map_file_path) {
+static void learn_vdroop(int last_charging_ema_mv, int discharge_ema_mv, MapVals& map) {
     if (last_charging_ema_mv <= 0 || discharge_ema_mv <= 0) return;
 
     int sample_mv = last_charging_ema_mv - discharge_ema_mv;
@@ -438,14 +487,13 @@ static void learn_vdroop(int last_charging_ema_mv, int discharge_ema_mv, MapVals
 
     int old_droop = (map.V_DROOP > 0 ? map.V_DROOP : DEFAULT_V_DROOP);
 
-    // 85% old, 15% new
-    int blended = (17 * old_droop + 3 * sample_mv) / 20;
+    // 67% old, 33% new
+    int blended = (2 * old_droop + sample_mv) / 3;
 
-    int max_step_up = 10;
-    int max_step_down = 5;
+    constexpr int max_step = 15;
 
-    int max_allowed = old_droop + max_step_up;
-    int min_allowed = old_droop - max_step_down;
+    int max_allowed = old_droop + max_step;
+    int min_allowed = old_droop - max_step;
 
     if (blended > max_allowed) blended = max_allowed;
     if (blended < min_allowed) blended = min_allowed;
@@ -458,10 +506,8 @@ static void learn_vdroop(int last_charging_ema_mv, int discharge_ema_mv, MapVals
         return;
     }
 
-    if (quantized != map.V_DROOP) {
-        map.V_DROOP = quantized;
-        save_map_atomic(map_file_path, map);
-    }
+    map.V_DROOP = quantized;
+    save_map_atomic(g_map_file, map);
 }
 
 static void learn_vfull(int voltage_raw_mv, int voltage_ema_mv, MapVals& map) {
@@ -493,7 +539,7 @@ static void learn_vfull(int voltage_raw_mv, int voltage_ema_mv, MapVals& map) {
     // Only save if meaningfully changed
     if (std::abs(quantized - old_vfull) >= 5) {
         map.V_FULL = quantized;
-        save_map_atomic(MAP_FILE, map);
+        save_map_atomic(g_map_file, map);
     }
 }
 
@@ -625,10 +671,28 @@ int main() {
     std::signal(SIGTERM, handle_signal);
     std::signal(SIGUSR1, handle_reset);
 
-    // Ensure directories exist
+    // Fire-and-forget hooks: prevent/cleanup zombies
+    std::signal(SIGCHLD, SIG_IGN);
+
+    // Ensure root directory exists
     fs::create_directories(fs::path(ROOT));
-    fs::create_directories(fs::path(ROOT) / "charging.d");
-    fs::create_directories(fs::path(ROOT) / "discharging.d");
+
+    // Ensure config is valid
+    ensure_config();
+
+    // Require map_dir
+    std::string map_dir = read_config();
+    if (map_dir.empty()) {
+        std::fprintf(stderr,
+            "batteryplus: Error: no voltage map file directory defined\n"
+            "batteryplus: Set map_dir=... in %s\n",
+            CONFIG_FILE);
+        return 1;
+    }
+
+    g_map_file = fs::path(map_dir) / MAP_FILENAME;
+    // Ensure directory exists
+    fs::create_directories(fs::path(map_dir));
 
     HookCache hooks;
     load_hook_cache(hooks);
@@ -642,11 +706,10 @@ int main() {
     BatteryPaths bp = *bp_opt;
 
     // Voltage map
-    MapVals map = load_map(MAP_FILE);
+    MapVals map = load_map(g_map_file);
 
-    if (!fs::exists(MAP_FILE)) {
-        fs::create_directories(fs::path(MAP_FILE).parent_path());
-        save_map_atomic(MAP_FILE, map);
+    if (!fs::exists(g_map_file)) {
+        save_map_atomic(g_map_file, map);
     }
 
     // State
@@ -858,7 +921,7 @@ int main() {
         // Learn droop once when armed
         if (droop_armed && !charging && discharging_streak >= 3) {
             if (last_charging_ema_mv > 0 && v_med > 0) {
-                learn_vdroop(last_charging_ema_mv, v_med,map, MAP_FILE);
+                learn_vdroop(last_charging_ema_mv, v_med, map);
             }
             // Reset arming
             droop_armed = false;
