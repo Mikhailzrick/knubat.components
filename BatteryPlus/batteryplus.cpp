@@ -41,13 +41,15 @@
 //
 //   • Calm percent exposure (UI-friendly)
 //       - Internal percent updated every INTERNAL_INTERVAL_S
-//       - Visible percent written only every WRITE_INTERVAL (halved under LOW_PCT_THRESHOLD)
-//       - On large resume jump (>=3%), snap to internal immediately
-//       - On small delta, smoothly catch up
+//       - Visible percent written only every WRITE_INTERVAL (halved under LOW_PCT_THRESHOLD or while charging)
+//       - On a resume hint (SIGUSR1 or loop gap >= 5 minutes), force an immediate visible update (step-limited)
+//       - On a long gap (>= 30 minutes), burst-sample voltage and snap visible percent to internal immediately
+//       - Otherwise, smoothly catch up using step limiting
 //
 //   • Hooks system (5% buckets)
 //       - Runs scripts in /etc/batteryplus/{charging.d|discharging.d}/
 //       - Based on visible percent bucket changes
+//       - Percent passed as $1
 //
 // Files:
 //   /tmp/battery.percent                 - exported visible % for UI polling
@@ -59,7 +61,8 @@
 //
 // Signals:
 //   SIGTERM / SIGINT — stop daemon
-//   SIGUSR1          — reset; triggers snap if delta is over threshold (i.e. can be used when resuming from suspend)
+//   SIGUSR1          — explicit resume hint: forces an immediate visible update (step-limited);
+//                      runs wildcard hooks; may also burst-sample and snap if the observed loop gap is large
 //
 // Build:
 //   aarch64-linux-gnu-g++ -O3 -flto -std=gnu++20 -Wall -Wextra -pedantic batteryplus.cpp -o batteryplus
@@ -83,6 +86,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <thread>
+#include <time.h>
 #include <unistd.h>
 #include <vector>
 
@@ -97,10 +101,10 @@ static constexpr const char* ROOT = "/etc/batteryplus"; // use {charging.d, disc
 
 // Timers
 static constexpr int INTERNAL_INTERVAL_S = 10; // how often internal calculations are done in seconds
-static constexpr int CHARGE_FULL_FALLBACK_TICKS = 30 * 60 / INTERNAL_INTERVAL_S; // 30min at 10s intervals
+static constexpr int CHARGE_FULL_FALLBACK_TICKS = 20 * 60 / INTERNAL_INTERVAL_S; // how long we wait once 99% is reached before we force "full"
 
 // Percent write parameters
-static constexpr int LOW_PCT_THRESHOLD = 10; // threshold where we update faster (%)
+static constexpr int LOW_PCT_THRESHOLD = 15; // threshold where we update faster (%)
 static constexpr int WRITE_INTERVAL = 60;
 
 // EMA parameters
@@ -119,6 +123,14 @@ static fs::path g_map_file;
 
 // ========================= Utilities =========================
 static void handle_reset(int) { g_reset = true; }
+
+static inline int64_t boottime_s() {
+    struct timespec ts{};
+    if (::clock_gettime(CLOCK_BOOTTIME, &ts) != 0) {
+        return 0;
+    }
+    return static_cast<int64_t>(ts.tv_sec);
+}
 
 static std::optional<std::string> slurp(const fs::path& p) {
     std::ifstream f(p);
@@ -254,7 +266,7 @@ static bool is_executable(const fs::directory_entry& de) {
     return ::access(de.path().c_str(), X_OK) == 0;
 }
 
-static int run_hook_file(const fs::path& file) {
+static int run_hook_file(const fs::path& file, int visible_percent) {
     pid_t pid = ::fork();
     if (pid < 0) return -1;
 
@@ -267,7 +279,12 @@ static int run_hook_file(const fs::path& file) {
             ::dup2(nullfd, STDERR_FILENO);
             ::close(nullfd);
         }
-        const char* argv[] = { file.c_str(), nullptr };
+        std::string pct = std::to_string(clampi(visible_percent, 0, 100));
+        const char* argv[] = {
+            file.c_str(),
+            pct.c_str(), // $1 = visible percent
+            nullptr
+        };
         ::execv(argv[0], (char* const*)argv);
         _exit(127);
     }
@@ -328,10 +345,10 @@ static void load_hook_cache(HookCache& hc) {
     hc.loaded = true;
 }
 
-static inline void run_paths(const std::vector<fs::path>& paths) {
+static inline void run_paths(const std::vector<fs::path>& paths, int visible_percent) {
     for (const auto& p : paths) {
         if (::access(p.c_str(), X_OK) == 0)
-            run_hook_file(p);
+            run_hook_file(p, visible_percent);
     }
 }
 
@@ -341,8 +358,8 @@ static void run_bucket_hooks_cached(const HookCache& hc, bool charging, int perc
     const auto& buckets = charging ? hc.charging : hc.discharging;
     const auto& any     = charging ? hc.charging_any : hc.discharging_any;
 
-    run_paths(buckets[bi]); // run all scripts for this 5% bucket
-    run_paths(any); // wildcard scripts every change
+    run_paths(buckets[bi], percent_value); // run all scripts for this 5% bucket
+    run_paths(any, percent_value); // wildcard scripts every change
 }
 
 // ========================= Battery discovery =========================
@@ -502,7 +519,7 @@ static void learn_vdroop(int last_charging_ema_mv, int discharge_ema_mv, MapVals
 
     int quantized = ((blended + 2) / 5) * 5; // round to nearest 5 mV
 
-    if (std::abs(quantized - map.V_DROOP) < 3) {
+    if (std::abs(quantized - old_droop) < 3) {
         return;
     }
 
@@ -561,6 +578,23 @@ static int read_voltage_mv(const fs::path& voltage_now) {
     return raw; // mV
 }
 
+static int burst_sample_voltage(const fs::path& voltage_now)
+{
+    int a = read_voltage_mv(voltage_now);
+    std::this_thread::sleep_for(1s);
+    int b = read_voltage_mv(voltage_now);
+    std::this_thread::sleep_for(1s);
+    int c = read_voltage_mv(voltage_now);
+
+    // Fix samples if possible or needed
+    if (a <= 0) a = (b > 0 ? b : c);
+    if (b <= 0) b = (a > 0 ? a : c);
+    if (c <= 0) c = (a > 0 ? a : b);
+
+    if (a <= 0 || b <= 0 || c <= 0) return -1;
+    return median3(a, b, c);
+}
+
 // Dynamic droop compensation
 static int compute_dynamic_droop_mv(int approx_pct, const MapVals& m)
 {
@@ -571,25 +605,22 @@ static int compute_dynamic_droop_mv(int approx_pct, const MapVals& m)
     // Baseline learned device droop
     int base = (m.V_DROOP > 0 ? m.V_DROOP : DEFAULT_V_DROOP);
 
-    // curb "rapid charging" appearance at low end
-    constexpr double FACTOR_MIN   = 2.0; // droop multiplier at 0%
-    constexpr int    LOW_BAND_MAX = 30; // max % which this stops being applied
-    constexpr double SHAPE_EXP    = 2.0; // >1.0 = more weight near 0%
+    // curb "rapid charging"
+    constexpr double MULT_MAX = 2.5;
+    constexpr double MULT_MIN = 0.15;
+    constexpr double SHAPE_GAMMA = 0.70;
 
-    double factor = 1.0;
-    if (approx_pct < LOW_BAND_MAX) {
-        double t = static_cast<double>(approx_pct) / LOW_BAND_MAX;
-        double w = 1.0 - std::clamp(t, 0.0, 1.0);
+    const double x = static_cast<double>(approx_pct) / 100.0;
+    const double w = 1.0 - std::clamp(x, 0.0, 1.0);
+    const double shaped = std::pow(w, SHAPE_GAMMA);
 
-        double shaped = std::pow(w, SHAPE_EXP);
-        factor = 1.0 + (FACTOR_MIN - 1.0) * shaped;
-    }
+    const double mult = MULT_MIN + (MULT_MAX - MULT_MIN) * shaped;
 
-    int droop = static_cast<int>(std::lround(base * factor));
+    int droop = static_cast<int>(std::lround(base * mult));
 
     // Clamp just in case
     int max_global = range_mv / 2; // at most half the voltage window
-    droop = clampi(droop, 10, max_global);
+    droop = clampi(droop, 0, max_global);
 
     return droop;
 }
@@ -716,18 +747,52 @@ int main() {
     SmoothedV sv;
     int internal_percent = -1; // smoothed percent from voltage
     int visible_percent = -1; // step-limited percent we expose
-    int last_bucket = -1;
     int last_charging_ema_mv = -1;
     bool vfull_recorded = false;
 
+    // Track charge/discharge transitions
+    bool last_charging = false;
+    bool last_charging_valid = false;
+
+    // Keyed by (mode, bucket) so 0% discharging can fire even if 0% charging fired
+    int last_hook_key = -1;
+
+    auto hook_key = [](bool charging_mode, int bucket_val /*0..100 step 5*/) -> int {
+        return (charging_mode ? 1000 : 0) + bucket_val;
+    };
+
     // Droop learning: require 3 stable ticks on each side
     int charging_streak = 0;
+    int charge_full_streak = 0; // consecutive ticks at >=99% while charging
     int discharging_streak = 0;
     bool droop_armed = false;
 
+    // Stabilize initial reading
+    int boot_v = burst_sample_voltage(bp.voltage_now);
+    if (boot_v > 0) {
+        sv.prev1 = sv.prev2 = boot_v;
+        sv.ema   = boot_v;
+    }
+
+    // Resume detection thresholds
+    static constexpr long SHORT_GAP_S = 10 * 60; // threshold for a nudge
+    static constexpr long LONG_GAP_S  = 60 * 60; // threshold for snap to new percent
+
     auto last_visible_write = std::chrono::steady_clock::now();
+    int64_t last_loop_bt_s = boottime_s();
+    long gap_s = 0;
 
     while (g_running) {
+        // Get time data
+        auto now = std::chrono::steady_clock::now();
+
+        int64_t now_bt_s = boottime_s();
+        gap_s = now_bt_s - last_loop_bt_s;
+        if (gap_s < 0) {
+            gap_s = 0;
+        }
+        last_loop_bt_s = now_bt_s;
+
         // Read status and voltage
         int voltage_raw_mv = read_voltage_mv(bp.voltage_now);
         std::string status_str = read_charge_status(bp.status);
@@ -735,8 +800,32 @@ int main() {
         bool charging = false;
         bool status_full = false;
         bool first_visible = (visible_percent < 0);
-        bool reset = g_reset.exchange(false);
         bool hooks_fired = false;
+
+        // Soft reset(resume) logic
+        bool explicit_reset = g_reset.exchange(false);
+        bool heuristic_resume = (gap_s >= SHORT_GAP_S);
+        bool long_resume_gap = (gap_s >= LONG_GAP_S);
+        bool soft_reset = explicit_reset || heuristic_resume;
+
+        // Reset droop learning so we don't record stale or garbage values
+        if (soft_reset) {
+            droop_armed = false;
+            charging_streak = 0;
+            discharging_streak = 0;
+            last_charging_ema_mv = -1;
+        }
+
+        bool snap_now = false;
+        if (long_resume_gap) {
+            // We get 3 quick samples for a reasonably fast accurate-ish percent
+            int v_stable = burst_sample_voltage(bp.voltage_now);
+            if (v_stable > 0) {
+                sv.prev1 = sv.prev2 = v_stable;
+                sv.ema   = v_stable;
+                snap_now = true;
+            }
+        }
 
         if (!status_str.empty()) {
             if (status_str.rfind("Charging", 0) == 0) {
@@ -746,6 +835,14 @@ int main() {
                 status_full = true;
             }
         }
+
+        // Detect charging state change
+        bool charging_changed = false;
+        if (last_charging_valid && (charging != last_charging)) {
+            charging_changed = true;
+        }
+        last_charging = charging;
+        last_charging_valid = true;
 
         // Track charging/discharging streaks, and arm droop learning after 3 charging ticks
         if (charging) {
@@ -811,7 +908,16 @@ int main() {
 
         internal_percent = target;
 
-        bool timeout_full = charging && internal_percent >= 99 && charging_streak >= CHARGE_FULL_FALLBACK_TICKS;
+        // track how long it's been since reaching 99% so we know if we need the fallback for full/100%
+        if (charging && visible_percent >= 99) {
+            if (charge_full_streak < CHARGE_FULL_FALLBACK_TICKS) {
+                charge_full_streak++;
+            }
+        } else {
+            charge_full_streak = 0;
+        }
+
+        bool timeout_full = charging && (charge_full_streak >= CHARGE_FULL_FALLBACK_TICKS);
 
         // Set to 100% once pmic reports
         if (charging) {
@@ -819,30 +925,6 @@ int main() {
                 internal_percent = 100;
             } else if (internal_percent > 99) {
                 internal_percent = 99;
-            }
-        }
-
-        // Compute delta
-        int delta_pct = 0;
-        if (!first_visible && visible_percent >= 0) {
-            delta_pct = std::abs(internal_percent - visible_percent);
-        }
-
-        // On reset decide if we should wipe smoothing
-        bool wipe_ema = false;
-        if (reset) {
-            if (first_visible || delta_pct >= 3) {
-                wipe_ema = true;
-            }
-        }
-
-        // If needed reset ema history
-        if (wipe_ema) {
-            if (voltage_raw_mv > 0) {
-                sv.prev1 = sv.prev2 = voltage_raw_mv;
-                sv.ema = voltage_raw_mv;
-            } else {
-                sv.prev1 = sv.prev2 = sv.ema = -1;
             }
         }
 
@@ -856,10 +938,15 @@ int main() {
 
         // Decide if we need to write the file / run hooks
         bool need_visible_update = false;
-        auto now = std::chrono::steady_clock::now();
 
         if (first_visible) {
             // Initial loop
+            need_visible_update = true;
+
+        } else if (snap_now) {
+            need_visible_update = true;
+        } else if (heuristic_resume && internal_percent != visible_percent) {
+            // allow one immediate step update after soft reset
             need_visible_update = true;
 
         } else if (internal_percent != visible_percent) {
@@ -871,10 +958,7 @@ int main() {
                 required_interval = WRITE_INTERVAL / 2; // lets just halve normal interval
             }
 
-            if (reset && delta_pct >= 3) {
-                // reset + meaningful change: force write now
-                need_visible_update = true;
-            } else if (elapsed_s >= required_interval) {
+            if (elapsed_s >= required_interval) {
                 need_visible_update = true;
             }
         }
@@ -885,15 +969,14 @@ int main() {
             if (first_visible) {
                 // Initial loop
                 new_visible = internal_percent;
-            } else if (reset && delta_pct >= 3) {
-                // reset + meaningful change: snap visible to internal
+            } else if (snap_now) {
                 new_visible = internal_percent;
             } else {
                 new_visible = step_limit(visible_percent, internal_percent, charging);
             }
 
             if (new_visible != visible_percent) {
-                visible_percent = new_visible;
+                visible_percent = clampi(new_visible, 0, 100);
                 fs::create_directories(fs::path(PERCENT_FILE).parent_path());
                 (void)write_atomic(PERCENT_FILE, std::to_string(visible_percent) + "\n", 0644);
                 last_visible_write = now;
@@ -901,20 +984,34 @@ int main() {
                 // fire once and on exact 5% increments
                 if (visible_percent % 5 == 0) {
                     int b = visible_percent;
-                    if (b != last_bucket) {
-                        run_bucket_hooks_cached(hooks, charging, visible_percent);
-                        last_bucket = b;
-                        hooks_fired = true; // we fired off hooks this loop
+                    int key = hook_key(charging, b);
+                    if (key != last_hook_key) {
+                        run_bucket_hooks_cached(hooks, charging, b);
+                        last_hook_key = key;
+                        hooks_fired = true;
                     }
                 }
             }
         }
 
+        // On plug/unplug(state change), rerun bucket hooks for the new charge state.
+        if (charging_changed && visible_percent >= 0 && (visible_percent % 5 == 0)) {
+            int b = visible_percent;
+            int key = hook_key(charging, b);
+
+            // Prevent duplicate execution if this same (mode,bucket) already fired recently or this loop
+            if (key != last_hook_key) {
+                run_bucket_hooks_cached(hooks, charging, b);
+                last_hook_key = key;
+                hooks_fired = true;
+            }
+        }
+
         // Run wildcard scripts once on reset only if we didn't already
-        if (reset) {
+        if (explicit_reset) {
             if (!hooks_fired) {
                 const auto& any = charging ? hooks.charging_any : hooks.discharging_any;
-                run_paths(any);
+                run_paths(any, visible_percent);
             }
         }
 
