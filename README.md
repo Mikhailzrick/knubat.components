@@ -321,12 +321,6 @@ Stops BatteryPlus and saves restore state when possible.
 
 Signals that the system has resumed or that BatteryPlus should immediately refresh its calculation path.
 
-Example:
-
-    kill -USR1 "$(cat /run/batteryplus.pid)"
-
-A udev rule or resume hook can use this after suspend/resume.
-
 ---
 
 ## Build
