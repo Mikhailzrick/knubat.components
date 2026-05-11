@@ -111,7 +111,8 @@
 //       already ran.
 //
 // Build:
-//   aarch64-linux-gnu-g++ -O3 -flto -std=gnu++20 -Wall -Wextra -pedantic batteryplus.cpp -o batteryplus
+//   aarch64 cross-build: aarch64-linux-gnu-g++ -O3 -flto -std=gnu++20 -Wall -Wextra -pedantic batteryplus.cpp -o batteryplus
+//   native x86-64: g++ -O3 -flto -std=gnu++20 -Wall -Wextra -pedantic batteryplus.cpp -o batteryplus
 
 #include <algorithm>
 #include <atomic>
