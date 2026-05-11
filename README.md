@@ -401,6 +401,9 @@ Recommended integrations include:
 
 ---
 
+# IdleWatcher
+## todo
+
 ## License
 
 BatteryPlus is licensed under the GNU General Public License version 2.
