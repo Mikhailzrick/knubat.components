@@ -56,8 +56,6 @@
 static constexpr int    DEFAULT_IDLE_S = 900; // 15 minutes
 static constexpr int    DEFAULT_EXTENDED_S = 3600; // 60 minutes
 static constexpr double DEFAULT_AXIS_DZ_PCT = 0.15; // 15%
-static constexpr int    AXIS_DZ_MIN = 64; // small floor
-static constexpr int    AXIS_DZ_BADSPAN = 128; // fallback just in case
 static double AXIS_DZ_PCT = DEFAULT_AXIS_DZ_PCT; // runtime deadzone, overridden by config
 
 static const int DEBOUNCE_MS = 3000; // global debounce
@@ -214,8 +212,8 @@ static void read_config_or_defaults(int &idle_s, int &extended_s) {
         double v = strtod(val, &end);
         if (end != val) {
           if (v > 1.0) v = v / 100.0; // treat 20..100 as percent
-          if (v < 0.0) v = 0.0;
-          if (v > 0.90) v = 0.90; // clamp sanity: ≤90% of span
+          if (v < 0.10) v = 0.10; // clamp sanity: min 10%
+          if (v > 0.90) v = 0.90; // clamp sanity: max 90%
           AXIS_DZ_PCT = v;
         }
       }
@@ -404,20 +402,23 @@ static void init_abs_info(Dev& d) {
         d.abs_min[code] = ai.minimum;
         d.abs_max[code] = ai.maximum;
 
+        long span = span_of(ai);
+        int dz = 0;
+
         if (is_hat_abs(code)) {
-            d.abs_dz[code] = 0; // HATs are unfiltered
-            continue;
+            dz = 0; // HATs are unfiltered
+        } else if (span > 0) {
+            if (span <= 2) {
+                dz = 0;
+            } else {
+                dz = (int)std::lround(span * AXIS_DZ_PCT);
+                if (dz < 0) dz = 0;
+            }
+        } else {
+            dz = 0; // Bad or unknown span: don't filter
         }
 
-      long span = span_of(ai);
-      int dz;
-      if (span > 0) {
-          dz = (int)std::lround(span * AXIS_DZ_PCT);
-          if (dz < AXIS_DZ_MIN) dz = AXIS_DZ_MIN;
-      } else {
-          dz = AXIS_DZ_BADSPAN; // bad/zero span fallback
-      }
-      d.abs_dz[code] = dz;
+        d.abs_dz[code] = dz;
     }
 }
 
@@ -486,18 +487,27 @@ static void handle_input(int fd, int64_t now) {
                   on_activity(now); pulsed = true; break;
 
             case EV_ABS: {
-                int code = e.code, val = e.value;
+                int code = e.code;
 
-                if (!dv.abs_seen[code]) { dv.abs_last[code] = val; dv.abs_seen[code] = true; break; }
+                if ((unsigned)code > ABS_MAX) // just in case
+                    break;
+
+                int val  = e.value;
+
+                if (!dv.abs_seen[code]) {
+                    dv.abs_last[code] = val;
+                    dv.abs_seen[code] = true;
+                    break;
+                }
 
                 int delta = std::abs(val - dv.abs_last[code]);
+                int dz    = dv.abs_dz[code];
+                if (dz < 0) dz = 0;
 
-                if (is_hat_abs(code)) {
-                    if (delta != 0) { dv.abs_last[code] = val; on_activity(now); pulsed = true; }
-                } else {
-                    int dz = dv.abs_dz[code]; // already per-axis
-                    if (dz <= 0) dz = AXIS_DZ_MIN;
-                    if (delta >= dz) { dv.abs_last[code] = val; on_activity(now); pulsed = true; }
+                if (delta > dz) {
+                    dv.abs_last[code] = val;
+                    on_activity(now);
+                    pulsed = true;
                 }
                 break;
             }
@@ -511,7 +521,7 @@ static void handle_input(int fd, int64_t now) {
 
 int main() {
     struct sigaction sa{};
-    sa.sa_handler = SIG_DFL;
+    sa.sa_handler = SIG_IGN;
     sa.sa_flags = SA_NOCLDWAIT;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGCHLD, &sa, nullptr);
