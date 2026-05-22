@@ -157,7 +157,7 @@ static constexpr int PEAK_STABILITY_WINDOW_MV = 30; // abort peak-based calibrat
 static constexpr int VFULL_DIS_SETTLE_S = 10; // settle time in seconds after unplug before recording V_FULL_DIS
 static constexpr int PEAK_TRACK_START_MV = 4000; // voltage threshold to begin top-of-charge tracking(in mv)
 static constexpr int MIN_RANGE_MV = 100; // minimum usable voltage span between empty and full(in mv)
-static constexpr int RESTORE_EMA_DELTA_MV = 30; // +/- range in mv where on start visible percent is restored
+static constexpr int RESTORE_EMA_DELTA_MV = 50; // +/- range in mv where on start visible percent is restored
 
 // EMA parameters
 static constexpr int ALPHA_NUM = 2;
@@ -1450,7 +1450,13 @@ int main() {
 
     // Resume detection thresholds
     static constexpr long SHORT_GAP_S = 15 * 60; // threshold for a nudge
-    static constexpr long LONG_GAP_S  = 60 * 60; // threshold for snap to new percent
+    static constexpr long LONG_GAP_S  = 60 * 60; // threshold for burst-sampling after a long suspend gap
+
+    // Long-gap resume snap thresholds.
+    // Downward movement is trusted more readily because battery drain during suspend is expected.
+    // Upward movement requires a larger delta because voltage can rebound after suspend
+    static constexpr int RESUME_SNAP_DOWN_DELTA_MV = 25;
+    static constexpr int RESUME_SNAP_UP_DELTA_MV   = 75;
 
     auto last_visible_write = std::chrono::steady_clock::now();
     int64_t last_loop_bt_s = boottime_s();
@@ -1491,13 +1497,26 @@ int main() {
 
         bool snap_now = false;
         if (long_resume_gap && g_cfg.mode == BatteryMode::Voltage) {
-            // Long resume gaps may reflect real battery movement while asleep;
-            // burst-sample and snap instead of slowly step-limiting stale percent.
+            // Long resume gaps may reflect real battery movement while asleep, but voltage can
+            // also rebound after suspend/load removal. Always burst-sample and reseed EMA so
+            // internal calculations restart from a current voltage, but only snap the visible
+            // percent if the voltage moved far enough to be meaningful.
+
+            int ema_before_resume = sv.ema;
+
             int v_stable = burst_sample_voltage(bp.voltage_now);
             if (v_stable > 0) {
                 sv.prev1 = sv.prev2 = v_stable;
                 sv.ema   = v_stable;
-                snap_now = true;
+
+                if (ema_before_resume > 0) {
+                    int resume_delta_mv = v_stable - ema_before_resume;
+
+                    if (resume_delta_mv >= RESUME_SNAP_UP_DELTA_MV ||
+                        resume_delta_mv <= -RESUME_SNAP_DOWN_DELTA_MV) {
+                        snap_now = true;
+                    }
+                }
             }
         }
 
