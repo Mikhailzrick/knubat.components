@@ -48,7 +48,6 @@
 //       - Uses median-of-3 plus EMA smoothing for voltage noise reduction
 //       - Optionally restores previous EMA and visible percent after daemon
 //         restart if voltage and charge state still match
-//       - Applies a small boot-only voltage compensation if discharging
 //
 //   • Visible percent behavior
 //       - Internal percent is recalculated every INTERNAL_INTERVAL_S
@@ -148,16 +147,17 @@ static constexpr const char* PERCENT_FILE = "/tmp/battery.percent";
 static constexpr const char* ROOT = "/etc/batteryplus"; // hook/config root: charging.d, discharging.d, state.d
 
 // Timers / Thresholds / Parameters
-static constexpr int INTERNAL_INTERVAL_S = 10; // how often internal calculations are done in seconds
-static constexpr int WRITE_INTERVAL_S = 60; // how often visible percent is written to the battery percent file in seconds
-static constexpr int WRITE_INTERVAL_DELTA_SMALL_S = 30; // how often visible percent updates(in seconds) when there's a small delta
-static constexpr int WRITE_INTERVAL_DELTA_LARGE_S = 15; // how often visible percent updates(in seconds) when there's a large delta
-static constexpr int PEAK_DWELL_S = 10 * 60; // time spent(in seconds) with no new higher peak before full is determined
+static constexpr int INTERNAL_INTERVAL_S = 15; // how often internal calculations are done in seconds
+static constexpr int WRITE_INTERVAL_S = 120; // how often visible percent is written to the battery percent file in seconds
+static constexpr int WRITE_INTERVAL_DELTA_SMALL_S = 60; // how often visible percent updates(in seconds) when there's a small delta
+static constexpr int WRITE_INTERVAL_DELTA_LARGE_S = 30; // how often visible percent updates(in seconds) when there's a large delta
+static constexpr int PEAK_DWELL_S = 15 * 60; // time spent(in seconds) with no new higher peak before full is determined
 static constexpr int PEAK_STABILITY_WINDOW_MV = 30; // abort peak-based calibration if charging EMA drops more than this below the observed peak
-static constexpr int VFULL_DIS_SETTLE_S = 10; // settle time in seconds after unplug before recording V_FULL_DIS
+static constexpr int VFULL_DIS_SETTLE_S = 15; // settle time in seconds after unplug before recording V_FULL_DIS
 static constexpr int PEAK_TRACK_START_MV = 4000; // voltage threshold to begin top-of-charge tracking(in mv)
 static constexpr int MIN_RANGE_MV = 100; // minimum usable voltage span between empty and full(in mv)
-static constexpr int RESTORE_EMA_DELTA_MV = 50; // +/- range in mv where on start visible percent is restored
+static constexpr int RESTORE_EMA_DELTA_CHG_MV = 100; // (charging)range in mv where on start previous visible percent is restored
+static constexpr int RESTORE_EMA_DELTA_DIS_MV = 50;  // (discharging)range in mv where on start previous visible percent is restored
 
 // EMA parameters
 static constexpr int ALPHA_NUM = 2;
@@ -223,6 +223,18 @@ static void handle_signal(int) {
 
 static void handle_resume_signal(int) {
     g_resume_hint = true;
+}
+
+static bool sleep_interruptible_s(int seconds) {
+    for (int i = 0; i < seconds; ++i) {
+        if (!g_running) {
+            return false;
+        }
+
+        std::this_thread::sleep_for(1s);
+    }
+
+    return g_running;
 }
 
 static int64_t boottime_s() {
@@ -932,11 +944,12 @@ static int update_smoothed_voltage(int voltage_raw_mv, const MapVals& map, Smoot
 
 static int burst_sample_voltage(const fs::path& voltage_now)
 {
-    std::this_thread::sleep_for(1s);
     int a = read_voltage_mv(voltage_now);
-    std::this_thread::sleep_for(1s);
+
+    if (!sleep_interruptible_s(1)) return -1;
     int b = read_voltage_mv(voltage_now);
-    std::this_thread::sleep_for(1s);
+
+    if (!sleep_interruptible_s(1)) return -1;
     int c = read_voltage_mv(voltage_now);
 
     // Fix samples if possible or needed
@@ -972,9 +985,9 @@ static int voltage_to_percent(int voltage_now_mv, const MapVals& m, bool chargin
     int v_100_start = v_full;
 
     if (!charging) {
-        constexpr double DISCHARGE_TOP_FRAC = 0.03; // fraction of range used for discharge-only 100% plateau
+        constexpr double DISCHARGE_TOP_FRAC = 0.02; // fraction of range used for discharge-only 100% plateau
         int frac_window_mv = (int)std::lround(full_range * DISCHARGE_TOP_FRAC);
-        frac_window_mv = clampi(frac_window_mv, 10, 30);
+        frac_window_mv = clampi(frac_window_mv, 10, 20);
         v_100_start = v_full - frac_window_mv;
     }
 
@@ -999,7 +1012,7 @@ static int voltage_to_percent(int voltage_now_mv, const MapVals& m, bool chargin
 
     if (charging) {
         // Charging curve: exponent fades from MAX -> MIN across the range (0% -> 100%)
-        constexpr double CHG_EXPONENT_MAX = 2.00; // strongest compression at 0%
+        constexpr double CHG_EXPONENT_MAX = 2.50; // strongest compression at 0%
         constexpr double CHG_EXPONENT_MIN = 1.00; // linear at full
 
         double exponent = CHG_EXPONENT_MAX - (CHG_EXPONENT_MAX - CHG_EXPONENT_MIN) * x;
@@ -1007,9 +1020,16 @@ static int voltage_to_percent(int voltage_now_mv, const MapVals& m, bool chargin
         shaped = std::pow(x, exponent);
     } else {
         // Discharging curve: blended S-curve strength
-        constexpr double DISCHARGE_SCURVE_STRENGTH = 0.50;
+        constexpr double DISCHARGE_SCURVE_STRENGTH_LOW  = 0.75;
+        constexpr double DISCHARGE_SCURVE_STRENGTH_HIGH = 0.50;
 
-        shaped = shape_scurve(x, DISCHARGE_SCURVE_STRENGTH);
+        double high_blend = smootherstep(x);
+
+        double strength =
+            DISCHARGE_SCURVE_STRENGTH_LOW -
+            (DISCHARGE_SCURVE_STRENGTH_LOW - DISCHARGE_SCURVE_STRENGTH_HIGH) * high_blend;
+
+        shaped = shape_scurve(x, strength);
     }
 
     const int base_percent = static_cast<int>(std::lround(shaped * 100.0));
@@ -1064,6 +1084,7 @@ static bool check_update_visible_percent(
     int required_interval = WRITE_INTERVAL_S;
     int delta = std::abs(internal_percent - visible_percent);
 
+    // allow faster catch up if needed.
     if (delta >= 6) {
         required_interval = WRITE_INTERVAL_DELTA_LARGE_S;
     } else if (delta >= 3) {
@@ -1101,7 +1122,11 @@ static void check_unplug_full_event(
 ) {
     // Only trust unplug-settle learning if we did not resume/suspend in between.
     if (charging_changed && !charging && fls.full_event_active && !resume_detected) {
-        std::this_thread::sleep_for(std::chrono::seconds(VFULL_DIS_SETTLE_S));
+        if (!sleep_interruptible_s(VFULL_DIS_SETTLE_S)) {
+            reset_full_learn_state(fls);
+            return;
+        }
+
         int v_burst = burst_sample_voltage(bp.voltage_now);
         if (learn_vfull_dis(v_burst, map)) {
             calib.learned_vfull_dis = true;
@@ -1308,9 +1333,6 @@ static StartupInitResult init_voltage_startup_state(
     int& internal_percent,
     int& visible_percent
 ) {
-    constexpr int BOOT_COMP_MAX_UPTIME_S = 30; // time(proc) since boot in seconds
-    constexpr int BOOT_COMP_MV = 10; // compensation applied at boot only when discharging
-
     StartupInitResult result;
 
     if (!bp.status.empty()) {
@@ -1318,23 +1340,22 @@ static StartupInitResult init_voltage_startup_state(
         result.restore_charging = (restore_status == ChargeStatus::Charging || restore_status == ChargeStatus::Full);
     }
 
-    int v_now = read_voltage_mv(bp.voltage_now);
-
-    // Early boot can read slightly low under startup load; compensate only while discharging.
-    if (v_now > 0 && !result.restore_charging && boottime_s() < BOOT_COMP_MAX_UPTIME_S) {
-        v_now += BOOT_COMP_MV;
-    }
+    int v_now = burst_sample_voltage(bp.voltage_now);
 
     auto rs_opt = consume_restore_state();
     if (rs_opt) {
         const auto& rs = *rs_opt;
+
+        int restore_delta_limit_mv = rs.charging
+            ? RESTORE_EMA_DELTA_CHG_MV
+            : RESTORE_EMA_DELTA_DIS_MV;
 
         if (v_now > 0 &&
             rs.ema_mv > 0 &&
             rs.visible_percent >= 0 &&
             rs.visible_percent <= 100 &&
             rs.charging == result.restore_charging &&
-            std::abs(v_now - rs.ema_mv) <= RESTORE_EMA_DELTA_MV)
+            std::abs(v_now - rs.ema_mv) <= restore_delta_limit_mv)
         {
             sv.prev1 = rs.ema_mv;
             sv.prev2 = rs.ema_mv;
