@@ -151,13 +151,22 @@ static constexpr int INTERNAL_INTERVAL_S = 15; // how often internal calculation
 static constexpr int WRITE_INTERVAL_S = 120; // how often visible percent is written to the battery percent file in seconds
 static constexpr int WRITE_INTERVAL_DELTA_SMALL_S = 60; // how often visible percent updates(in seconds) when there's a small delta
 static constexpr int WRITE_INTERVAL_DELTA_LARGE_S = 30; // how often visible percent updates(in seconds) when there's a large delta
-static constexpr int PEAK_DWELL_S = 15 * 60; // time spent(in seconds) with no new higher peak before full is determined
-static constexpr int PEAK_STABILITY_WINDOW_MV = 30; // abort peak-based calibration if charging EMA drops more than this below the observed peak
+static constexpr int PEAK_DWELL_S = 30 * 60; // seconds spent with no new peak before full is determined. Fallback in case full never reported.
+static constexpr int PEAK_STABILITY_WINDOW_MV = 20; // abort peak-based calibration if charging EMA drops more than this below the observed peak
 static constexpr int VFULL_DIS_SETTLE_S = 15; // settle time in seconds after unplug before recording V_FULL_DIS
 static constexpr int PEAK_TRACK_START_MV = 4000; // voltage threshold to begin top-of-charge tracking(in mv)
-static constexpr int MIN_RANGE_MV = 100; // minimum usable voltage span between empty and full(in mv)
-static constexpr int RESTORE_EMA_DELTA_CHG_MV = 100; // (charging)range in mv where on start previous visible percent is restored
-static constexpr int RESTORE_EMA_DELTA_DIS_MV = 50;  // (discharging)range in mv where on start previous visible percent is restored
+static constexpr int MIN_RANGE_MV = 400; // minimum usable voltage span between empty and full(in mv)
+static constexpr int DISCHARGE_100_WINDOW_MV = 20; // reports 100% when discharging if within this range (in mv) from learned V_FULL_DIS
+
+// Startup restore voltage windows (mv)
+static constexpr int RESTORE_CHG_DOWN_MV = 50;
+static constexpr int RESTORE_CHG_UP_MV = 100;
+static constexpr int RESTORE_DIS_DOWN_MV = 50;
+static constexpr int RESTORE_DIS_UP_MV = 25;
+
+// Startup discharge compensation
+static constexpr int BOOT_COMP_MAX_UPTIME_S = 60;
+static constexpr int BOOT_COMP_MV = 15;
 
 // EMA parameters
 static constexpr int ALPHA_NUM = 2;
@@ -822,8 +831,8 @@ static bool learn_vfull_chg(int voltage_ema_mv, MapVals& map) {
         return false;
     }
 
-    // Quantize to 5 mV so tiny EMA movement does not churn the map file.
-    int quantized_mv = ((candidate_mv + 2) / 5) * 5;
+    // Quantize to up to nearest 5 mV so tiny EMA movement does not churn the map file.
+    int quantized_mv = ((candidate_mv + 4) / 5) * 5;
 
     // Only save if meaningfully changed
     if (std::abs(quantized_mv - old_vfull_mv) >= 5) {
@@ -843,12 +852,11 @@ static bool learn_vfull_dis(int voltage_ema_mv, MapVals& map) {
         return false;
     }
 
-    // Quantize to 5 mV so tiny EMA movement does not churn the map file.
-    int quantized_mv = ((candidate_mv + 2) / 5) * 5;
+    // Quantize down to nearest 5 mV so tiny EMA movement does not churn the map file.
+    int quantized_mv = (candidate_mv / 5) * 5;
 
-    // Discharge-side full should sit below charge-side full after unplug settle.
-    // Keep at least 25 mV separation so discharge mode has a usable 100% plateau.
-    int max_dis_mv = map.V_FULL_CHG - 25;
+    // Discharge-side full should remain below charge-side full.
+    int max_dis_mv = map.V_FULL_CHG - 10;
     if (max_dis_mv < 3600) {
         return false;
     }
@@ -980,15 +988,10 @@ static int voltage_to_percent(int voltage_now_mv, const MapVals& m, bool chargin
         return 1;
     }
 
-    const int full_range = v_full - v_empty;
-
     int v_100_start = v_full;
 
     if (!charging) {
-        constexpr double DISCHARGE_TOP_FRAC = 0.02; // fraction of range used for discharge-only 100% plateau
-        int frac_window_mv = (int)std::lround(full_range * DISCHARGE_TOP_FRAC);
-        frac_window_mv = clampi(frac_window_mv, 10, 20);
-        v_100_start = v_full - frac_window_mv;
+        v_100_start = v_full - DISCHARGE_100_WINDOW_MV;
     }
 
     if (v_100_start < v_empty + MIN_RANGE_MV) {
@@ -1114,6 +1117,7 @@ static int compute_new_visible_percent(
 static void check_unplug_full_event(
     const BatteryPaths& bp,
     MapVals& map,
+    SmoothedV& sv,
     FullLearnState& fls,
     CalibrationState& calib,
     bool charging,
@@ -1128,6 +1132,12 @@ static void check_unplug_full_event(
         }
 
         int v_burst = burst_sample_voltage(bp.voltage_now);
+
+        // Restart smoothing from the settled post unplug voltage.
+        sv.prev1 = v_burst;
+        sv.prev2 = v_burst;
+        sv.ema = v_burst;
+
         if (learn_vfull_dis(v_burst, map)) {
             calib.learned_vfull_dis = true;
             create_calibrated_flag(calib);
@@ -1260,6 +1270,7 @@ static PercentResult run_voltage_mode(
     check_unplug_full_event(
         bp,
         map,
+        sv,
         fls,
         calib,
         charging,
@@ -1335,9 +1346,11 @@ static StartupInitResult init_voltage_startup_state(
 ) {
     StartupInitResult result;
 
+    ChargeStatus startup_status = ChargeStatus::Unknown;
+
     if (!bp.status.empty()) {
-        ChargeStatus restore_status = read_charge_status(bp.status);
-        result.restore_charging = (restore_status == ChargeStatus::Charging || restore_status == ChargeStatus::Full);
+        startup_status = read_charge_status(bp.status);
+        result.restore_charging = (startup_status == ChargeStatus::Charging || startup_status == ChargeStatus::Full);
     }
 
     int v_now = burst_sample_voltage(bp.voltage_now);
@@ -1346,16 +1359,20 @@ static StartupInitResult init_voltage_startup_state(
     if (rs_opt) {
         const auto& rs = *rs_opt;
 
-        int restore_delta_limit_mv = rs.charging
-            ? RESTORE_EMA_DELTA_CHG_MV
-            : RESTORE_EMA_DELTA_DIS_MV;
+        int restore_delta_mv = v_now - rs.ema_mv;
+
+        bool voltage_matches = rs.charging
+            ? (restore_delta_mv >= -RESTORE_CHG_DOWN_MV &&
+            restore_delta_mv <=  RESTORE_CHG_UP_MV)
+            : (restore_delta_mv >= -RESTORE_DIS_DOWN_MV &&
+            restore_delta_mv <=  RESTORE_DIS_UP_MV);
 
         if (v_now > 0 &&
             rs.ema_mv > 0 &&
             rs.visible_percent >= 0 &&
             rs.visible_percent <= 100 &&
             rs.charging == result.restore_charging &&
-            std::abs(v_now - rs.ema_mv) <= restore_delta_limit_mv)
+            voltage_matches)
         {
             sv.prev1 = rs.ema_mv;
             sv.prev2 = rs.ema_mv;
@@ -1368,7 +1385,13 @@ static StartupInitResult init_voltage_startup_state(
     }
 
     // If restore was not used, always pre-seed EMA from the startup voltage for additional smoothing
+    // Compensate for boot only load voltage suppression while discharging
     if (!result.restored_state && v_now > 0) {
+        if (startup_status == ChargeStatus::Discharging &&
+            boottime_s() < BOOT_COMP_MAX_UPTIME_S) {
+            v_now += BOOT_COMP_MV;
+        }
+
         sv.prev1 = v_now;
         sv.prev2 = v_now;
         sv.ema   = v_now;
