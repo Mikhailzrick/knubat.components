@@ -92,8 +92,15 @@
 // Config:
 //   /etc/batteryplus/batteryplus.conf
 //
-//   Required:
+//   Data directory:
 //       data_dir=<absolute persistent directory>
+//
+//       If data_dir is blank, BatteryPlus uses:
+//           $XDG_CONFIG_HOME/batteryplus
+//       or:
+//           $HOME/.config/batteryplus
+//
+//       <data_dir>/batteryplus.conf may override configuration settings (except data_dir).
 //
 //   Optional:
 //       mode=voltage|pmic
@@ -142,6 +149,7 @@ using namespace std::chrono_literals;
 // ========================= Config (constants) =========================
 static constexpr const char* MAP_FILENAME = "batteryplus-voltage.map";
 static constexpr const char* RESTORE_STATE_FILENAME = "batteryplus-restore.state";
+static constexpr const char* OVERRIDE_CONFIG_FILENAME = "batteryplus.conf";
 static constexpr const char* CONFIG_FILE = "/etc/batteryplus/batteryplus.conf";
 static constexpr const char* PERCENT_FILE = "/tmp/battery.percent";
 static constexpr const char* ROOT = "/etc/batteryplus"; // hook/config root: charging.d, discharging.d, state.d
@@ -412,7 +420,10 @@ static void ensure_config() {
     if (!f) return;
 
     std::fprintf(f,
-        "# data_dir is required and should be an absolute path to a persistent directory\n"
+        "# data_dir should be an absolute persistent directory\n"
+        "# if blank BatteryPlus uses $XDG_CONFIG_HOME/batteryplus\n"
+        "# or $HOME/.config/batteryplus when XDG_CONFIG_HOME is not valid\n"
+        "# <data_dir>/batteryplus.conf may override settings (except data_dir)\n"
         "# possible modes: voltage(default) and pmic\n"
         "[Config]\n"
         "mode=voltage\n"
@@ -425,84 +436,178 @@ static void ensure_config() {
     std::fclose(f);
 }
 
-static ConfigVals read_config() {
-    ConfigVals cfg;
+static fs::path resolve_default_data_dir() {
+    const char* xdg_config_home = std::getenv("XDG_CONFIG_HOME");
 
-    std::FILE* f = std::fopen(CONFIG_FILE, "r");
-    if (!f) return cfg;
+    if (xdg_config_home != nullptr && xdg_config_home[0] != '\0') {
+        fs::path xdg_path(xdg_config_home);
+
+        if (xdg_path.is_absolute()) {
+            return xdg_path / "batteryplus";
+        }
+    }
+
+    const char* home = std::getenv("HOME");
+
+    if (home != nullptr && home[0] != '\0') {
+        fs::path home_path(home);
+
+        if (home_path.is_absolute()) {
+            return home_path / ".config" / "batteryplus";
+        }
+    }
+
+    return {};
+}
+
+static void read_config_file(
+    const fs::path& config_path,
+    ConfigVals& cfg,
+    bool allow_data_dir
+) {
+    std::FILE* f = std::fopen(config_path.c_str(), "r");
+    if (!f) {
+        return;
+    }
 
     char line[512];
 
     while (std::fgets(line, sizeof(line), f)) {
         char* p = line;
 
-        // strip leading spaces
-        while (*p == ' ' || *p == '\t') ++p;
+        // Strip leading spaces.
+        while (*p == ' ' || *p == '\t') {
+            ++p;
+        }
 
-        // skip blanks/comments/section headers
-        if (*p == '\0' || *p == '\n' || *p == '#' || *p == '[') continue;
+        // Skip blanks, comments, and section headers.
+        if (*p == '\0' || *p == '\n' || *p == '#' || *p == '[') {
+            continue;
+        }
 
         // key=value
         char* eq = std::strchr(p, '=');
-        if (!eq) continue;
+        if (!eq) {
+            continue;
+        }
+
         *eq = '\0';
 
         char* key = p;
         char* val = eq + 1;
 
-        // trim trailing key spaces
-        for (char* t = key + std::strlen(key); t > key &&
-             (t[-1] == ' ' || t[-1] == '\t' || t[-1] == '\r' || t[-1] == '\n'); --t)
+        // Trim trailing key whitespace.
+        for (char* t = key + std::strlen(key);
+             t > key &&
+             (t[-1] == ' ' || t[-1] == '\t' ||
+              t[-1] == '\r' || t[-1] == '\n');
+             --t) {
             t[-1] = '\0';
+        }
 
-        // trim leading val spaces
-        while (*val == ' ' || *val == '\t') ++val;
+        // Trim leading value whitespace.
+        while (*val == ' ' || *val == '\t') {
+            ++val;
+        }
 
-        // trim trailing val spaces/newlines
-        for (char* t = val + std::strlen(val); t > val &&
-             (t[-1] == ' ' || t[-1] == '\t' || t[-1] == '\r' || t[-1] == '\n'); --t)
+        // Trim trailing value whitespace.
+        for (char* t = val + std::strlen(val);
+             t > val &&
+             (t[-1] == ' ' || t[-1] == '\t' ||
+              t[-1] == '\r' || t[-1] == '\n');
+             --t) {
             t[-1] = '\0';
+        }
 
         if (std::strcmp(key, "mode") == 0) {
             to_lower_inplace(val);
 
             if (std::strcmp(val, "pmic") == 0) {
                 cfg.mode = BatteryMode::Pmic;
-            } else {
+            } else if (std::strcmp(val, "voltage") == 0) {
                 cfg.mode = BatteryMode::Voltage;
             }
+
         } else if (std::strcmp(key, "data_dir") == 0) {
-            cfg.data_dir = val;
+            if (allow_data_dir) {
+                cfg.data_dir = val;
+            }
+
         } else if (std::strcmp(key, "V_EMPTY_DIS") == 0) {
             char* end = nullptr;
             long v = std::strtol(val, &end, 10);
-            if (end != val) cfg.V_EMPTY_DIS = static_cast<int>(v);
+
+            if (end != val && *end == '\0') {
+                cfg.V_EMPTY_DIS = static_cast<int>(v);
+            }
+
         } else if (std::strcmp(key, "V_EMPTY_CHG") == 0) {
             char* end = nullptr;
             long v = std::strtol(val, &end, 10);
-            if (end != val) cfg.V_EMPTY_CHG = static_cast<int>(v);
+
+            if (end != val && *end == '\0') {
+                cfg.V_EMPTY_CHG = static_cast<int>(v);
+            }
         }
     }
 
     std::fclose(f);
+}
 
-    // Sanity V_EMPTY_DIS
+static void validate_config(
+    ConfigVals& cfg,
+    const ConfigVals& fallback
+) {
+    // Invalid values fall back to the preceding configuration layer.
     if (cfg.V_EMPTY_DIS < 3000 || cfg.V_EMPTY_DIS > 3400) {
-        cfg.V_EMPTY_DIS = DEFAULT_V_EMPTY_DIS;
+        cfg.V_EMPTY_DIS = fallback.V_EMPTY_DIS;
     }
 
-    // Sanity V_EMPTY_CHG
     if (cfg.V_EMPTY_CHG < 3300 || cfg.V_EMPTY_CHG > 3600) {
-        cfg.V_EMPTY_CHG = DEFAULT_V_EMPTY_CHG;
+        cfg.V_EMPTY_CHG = fallback.V_EMPTY_CHG;
     }
 
-    // Charging empty should always be higher than discharging empty
+    // Reject an invalid combined pair from the new layer.
     if (cfg.V_EMPTY_CHG <= cfg.V_EMPTY_DIS) {
-        cfg.V_EMPTY_CHG = DEFAULT_V_EMPTY_CHG;
-        if (cfg.V_EMPTY_CHG <= cfg.V_EMPTY_DIS) {
-            cfg.V_EMPTY_DIS = DEFAULT_V_EMPTY_DIS;
-        }
+        cfg.V_EMPTY_CHG = fallback.V_EMPTY_CHG;
+        cfg.V_EMPTY_DIS = fallback.V_EMPTY_DIS;
     }
+}
+
+static ConfigVals read_config() {
+    ConfigVals cfg;
+    const ConfigVals defaults;
+
+    // Load and validate the base system configuration.
+    read_config_file(CONFIG_FILE, cfg, true);
+    validate_config(cfg, defaults);
+
+    // Only accept an absolute data_dir from the base configuration.
+    if (!cfg.data_dir.empty() && !cfg.data_dir.is_absolute()) {
+        cfg.data_dir.clear();
+    }
+
+    // If data_dir was not set, use the standard user config location.
+    if (cfg.data_dir.empty()) {
+        cfg.data_dir = resolve_default_data_dir();
+    }
+
+    if (cfg.data_dir.empty()) {
+        return cfg;
+    }
+
+    // Preserve the validated base layer so invalid overrides can be ignored.
+    const ConfigVals base_cfg = cfg;
+
+    // Load persistent overrides. Ignore data_dir if present.
+    read_config_file(
+        cfg.data_dir / OVERRIDE_CONFIG_FILENAME,
+        cfg,
+        false
+    );
+
+    // Invalid override values fall back to the validated base layer.
+    validate_config(cfg, base_cfg);
 
     return cfg;
 }
@@ -1416,13 +1521,12 @@ int main() {
     // Ensure config is valid
     ensure_config();
 
-    // Require data_dir
+    // Load layered configuration and resolve the persistent data directory.
     g_cfg = read_config();
+
     if (g_cfg.data_dir.empty()) {
         std::fprintf(stderr,
-            "batteryplus: Error: no data_dir defined\n"
-            "batteryplus: Set data_dir=... in %s\n",
-            CONFIG_FILE);
+            "batteryplus: Error: unable to resolve persistent data directory\n");
         return 1;
     }
 
@@ -1432,7 +1536,14 @@ int main() {
     g_paths.restore_state_file = g_paths.data_dir / RESTORE_STATE_FILENAME;
 
     // Ensure directory exists
-    fs::create_directories(g_paths.data_dir);
+    std::error_code data_dir_ec;
+    fs::create_directories(g_paths.data_dir, data_dir_ec);
+
+    if (data_dir_ec) {
+        std::fprintf(stderr,
+            "batteryplus: Error: unable to create persistent data directory\n");
+        return 1;
+    }
 
     HookCache hooks;
     load_hook_cache(hooks);
