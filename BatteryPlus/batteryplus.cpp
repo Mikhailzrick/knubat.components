@@ -807,7 +807,8 @@ static std::optional<BatteryPaths> find_battery() {
     };
 
     auto has_battery_signal = [](const fs::path& d) {
-        return fs::exists(d / "voltage_now") || fs::exists(d / "capacity");
+        return fs::exists(d / "voltage_now") || fs::exists(d / "voltage_avg") ||
+               fs::exists(d / "capacity");
     };
 
     // Prefer likely battery/fuel-gauge supplies and require either voltage_now
@@ -826,6 +827,8 @@ static std::optional<BatteryPaths> find_battery() {
 
         if (fs::exists(d / "voltage_now"))
             bp.voltage_now = d / "voltage_now";
+        else if (fs::exists(d / "voltage_avg"))
+            bp.voltage_now = d / "voltage_avg";
 
         if (fs::exists(d / "capacity"))
             bp.capacity = d / "capacity";
