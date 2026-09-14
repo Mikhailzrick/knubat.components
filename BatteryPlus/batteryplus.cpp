@@ -1654,7 +1654,12 @@ int main() {
         }
 
         bool snap_now = false;
-        if (long_resume_gap && g_cfg.mode == BatteryMode::Voltage) {
+        if (resume_detected && g_cfg.mode == BatteryMode::Pmic) {
+            // The kernel gauge has already reconciled itself across the
+            // sleep; a step-limited, direction-locked visible value would
+            // hide that for a long time.
+            snap_now = true;
+        } else if (long_resume_gap && g_cfg.mode == BatteryMode::Voltage) {
             // Long resume gaps may reflect real battery movement while asleep, but voltage can
             // also rebound after suspend/load removal. Always burst-sample and reseed EMA so
             // internal calculations restart from a current voltage, but only snap the visible
