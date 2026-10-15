@@ -1,5 +1,5 @@
 // BatteryPlus — battery percentage daemon for handheld Linux systems
-// Version 1.2.0
+// Version 1.2.1
 // Copyright (c) 2025 Mikhailzrick
 //
 // This program is free software: you can redistribute it and/or modify
@@ -2584,10 +2584,8 @@ static StartupInitResult init_voltage_startup_state(
 
     visible_percent = decision.visible_percent;
 
-    // A blended result may differ from the existing percent file, so write it once.
-    result.force_visible_write =
-        decision.mode == RestoreMode::Blend &&
-        decision.visible_percent != saved->visible_percent;
+    // Always publish the restored percentage even if an older output file exists.
+    result.force_visible_write = true;
 
     return result;
 }
